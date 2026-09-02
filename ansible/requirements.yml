@@ -1,0 +1,14 @@
+---
+# Ansible Galaxy collection requirements for deploying cf-rs.
+#
+# Install with:
+#   ansible-galaxy collection install -r requirements.yml
+#
+# community.docker is required by the cf_rs role's Docker deploy mode
+# (community.docker.docker_container, community.docker.docker_network).
+# It is only exercised when cf_rs_deploy_mode=docker, but is listed
+# unconditionally so a single `ansible-galaxy collection install -r
+# requirements.yml` prepares the control node for either mode.
+collections:
+  - name: community.docker
+    version: ">=3.10.0"

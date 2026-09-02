@@ -45,3 +45,14 @@ jobs:
           python-version: "3.12"
       - run: pip install ansible-lint ansible-core
       - run: ansible-lint ansible/
+
+  molecule:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "molecule" "molecule-plugins[docker]" ansible-core docker
+      - run: molecule test
+        working-directory: ansible/roles/cf_rs

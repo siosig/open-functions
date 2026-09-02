@@ -1,0 +1,116 @@
+---
+# "service" tagged tasks here reconcile the running state (start/restart
+# the unit, or create/reconcile the container) against whatever
+# tasks/config.yml just rendered; "verify" tagged tasks confirm the
+# result. Running the service-reconcile step here rather than in
+# install_systemd.yml/install_docker.yml is what lets it happen after
+# config.toml exists - see the ordering note at the top of
+# tasks/main.yml.
+
+- name: Ensure the cf-rs service is enabled and started (systemd mode)
+  ansible.builtin.systemd_service:
+    name: "{{ cf_rs_service_name }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  when: cf_rs_deploy_mode == 'systemd'
+  tags:
+    - service
+
+- name: Look up the docker socket group id, for --group-add (docker mode)
+  ansible.builtin.stat:
+    path: /var/run/docker.sock
+  register: cf_rs_docker_socket_stat
+  when: cf_rs_deploy_mode == 'docker' and cf_rs_enable_docker
+  tags:
+    - service
+
+- name: Compute the cf-rs container's published ports and volumes (docker mode)
+  ansible.builtin.set_fact:
+    cf_rs_published_ports: >-
+      {{
+        [cf_rs_invoke_bind_address ~ ':' ~ cf_rs_invoke_port ~ ':' ~ cf_rs_invoke_port ~ '/tcp',
+         cf_rs_admin_bind_address ~ ':' ~ cf_rs_admin_port ~ ':' ~ cf_rs_admin_port ~ '/tcp']
+      }}
+    cf_rs_container_volumes: >-
+      {{
+        [cf_rs_data_dir ~ ':' ~ cf_rs_container_data_dir,
+         cf_rs_config_path ~ ':' ~ cf_rs_config_path ~ ':ro']
+        + (['/var/run/docker.sock:/var/run/docker.sock'] if cf_rs_enable_docker else [])
+        + (cf_rs_source_mounts | map('regex_replace', '^(.*)$', '\1:\1:ro') | list)
+      }}
+  when: cf_rs_deploy_mode == 'docker'
+  tags:
+    - service
+
+- name: Run the cf-rs container (docker mode)
+  community.docker.docker_container:
+    name: "{{ cf_rs_service_name }}"
+    image: "{{ cf_rs_image }}:{{ cf_rs_image_tag }}"
+    state: started
+    restart_policy: "{{ cf_rs_docker_restart_policy }}"
+    stop_timeout: "{{ cf_rs_shutdown_grace_secs + 10 }}"
+    networks:
+      - name: "{{ cf_rs_docker_network }}"
+    networks_cli_compatible: true
+    # No separate purge_networks: true - community.docker removed that
+    # parameter (present as a module option in older 1.x/2.x releases,
+    # gone by the >=3.10.0 this role's collection requirement pins, and
+    # confirmed absent in the tested 5.2.2). The module's own docs now
+    # point at exactly what comparisons: '*': strict below already does:
+    # "To remove a container from one or more networks, use
+    # `networks: strict` in the `comparisons` option."
+    published_ports: "{{ cf_rs_published_ports }}"
+    volumes: "{{ cf_rs_container_volumes }}"
+    groups: "{{ [cf_rs_docker_socket_stat.stat.gid | string] if cf_rs_enable_docker else omit }}"
+    comparisons:
+      '*': strict
+  when: cf_rs_deploy_mode == 'docker'
+  tags:
+    - service
+
+- name: Read the running cf-rs version (systemd mode)
+  ansible.builtin.command:
+    cmd: "{{ cf_rs_binary_path }} version"
+  register: cf_rs_reported_version_systemd
+  changed_when: false
+  when: cf_rs_deploy_mode == 'systemd'
+  tags:
+    - verify
+
+- name: Read the running cf-rs version (docker mode)
+  ansible.builtin.command:
+    cmd: "docker exec {{ cf_rs_service_name }} cf-rs version"
+  register: cf_rs_reported_version_docker
+  changed_when: false
+  when: cf_rs_deploy_mode == 'docker'
+  tags:
+    - verify
+
+- name: Assert the deployed cf-rs binary/image matches cf_rs_version
+  ansible.builtin.assert:
+    that:
+      - cf_rs_version in (cf_rs_reported_version_systemd if cf_rs_deploy_mode == 'systemd' else cf_rs_reported_version_docker).stdout
+    fail_msg: >-
+      Deployed cf-rs does not report version {{ cf_rs_version }}:
+      {{ (cf_rs_reported_version_systemd if cf_rs_deploy_mode == 'systemd' else cf_rs_reported_version_docker).stdout }}
+    quiet: true
+  tags:
+    - verify
+
+- name: Wait for cf-rs to report ready on /readyz
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ cf_rs_admin_port }}/readyz"
+    status_code: 200
+    headers: "{{ {'Authorization': 'Bearer ' + cf_rs_admin_token} if cf_rs_admin_token | length > 0 else {} }}"
+  register: cf_rs_readyz
+  until: cf_rs_readyz.status == 200
+  # The contract's literal "retries: 30, delay: 2" is a 60s budget, which
+  # is exactly cf_rs_verify_timeout_secs' default (60) - deriving retries
+  # from it here (delay fixed at 2s) keeps that budget configurable
+  # instead of silently ignoring cf_rs_verify_timeout_secs.
+  retries: "{{ (cf_rs_verify_timeout_secs / 2) | round(0, 'ceil') | int }}"
+  delay: 2
+  when: cf_rs_verify | bool
+  tags:
+    - verify

@@ -1,0 +1,53 @@
+---
+# Tag design (see specs/001-cloud-functions-local/contracts/ansible-vars.md,
+# "Tags"): preflight, install, config, service, verify.
+#
+# Ordering matters here in a way file-per-concern naming alone doesn't
+# convey, so it is spelled out explicitly:
+#
+#   1. preflight.yml   (tag: always)   - sanity-check variables first.
+#   2. install_*.yml   (tag: install)  - provisioning only: user/group,
+#      directories, binary download (systemd) or network (docker). No
+#      service/container is started yet.
+#   3. config.yml       (tag: config)  - render + validate config.toml.
+#      systemd's validate runs the just-downloaded binary directly, so it
+#      must come after step 2's binary download. Notifies a restart
+#      handler for later runs.
+#   4. verify.yml        (tags: service, verify) - *first* reconciles the
+#      running state (systemd unit enabled+started, or the docker
+#      container created/reconciled) now that config.toml genuinely
+#      exists - starting a Type=notify unit or bind-mounting config.toml
+#      into a container any earlier would either hang (systemd blocks
+#      `systemctl start` until READY=1, which needs a config file to
+#      parse) or corrupt the bind mount (docker would materialize an
+#      empty directory at that path instead). *Then* it asserts the
+#      reported version and polls /readyz.
+#
+# This ordering is also what makes `--tags config,service` behave exactly
+# as the contract requires: it renders config.toml (tag config, which
+# notifies the restart handler) and re-runs verify.yml's idempotent
+# service-reconcile task (tag service, changed=0 when nothing else
+# changed) - install_*.yml's binary/image provisioning is skipped
+# entirely, and the actual restart is applied by the handler.
+
+- name: Assert supported deploy mode and run preflight checks
+  ansible.builtin.import_tasks: preflight.yml
+  tags:
+    - preflight
+    - always
+
+- name: Install and start cf-rs as a systemd service
+  ansible.builtin.import_tasks: install_systemd.yml
+  when: cf_rs_deploy_mode == 'systemd'
+
+- name: Install and start cf-rs as a Docker container
+  ansible.builtin.import_tasks: install_docker.yml
+  when: cf_rs_deploy_mode == 'docker'
+
+- name: Render and validate cf-rs configuration
+  ansible.builtin.import_tasks: config.yml
+  tags:
+    - config
+
+- name: Reconcile the running service/container and verify the deployment
+  ansible.builtin.import_tasks: verify.yml

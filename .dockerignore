@@ -1,0 +1,33 @@
+# Keep the Docker build context small and avoid invalidating layer caches
+# with files the image build never reads. See Dockerfile for what actually
+# gets COPY'd in (workspace manifests/source + docker/config.toml).
+
+# VCS / editor / agent metadata
+.git/
+.github/
+.vscode/
+.claude/
+
+# Build artifacts (rebuilt fresh in-container; also keeps the context small)
+/target/
+/target-agents/
+examples/*/target/
+
+# spec-kit planning artifacts - not needed to build the binary
+specs/
+.specify/
+
+# Standalone example function crates: each is its own [workspace], not a
+# member of the root workspace, and irrelevant to building the cf-rs binary
+examples/
+
+# Docs
+README.ja.md
+*.md
+
+# Local scratch / misc
+/tmp/
+.gitignore
+.secretlintignore
+.secretlintrc.json
+.secretlintrc.local.json

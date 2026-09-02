@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # Cross-compile the cf-rs binary for each release target with
+  # cargo-zigbuild against the musl targets, producing statically linked
+  # binaries with no glibc dependency (same approach as the repo-root
+  # Dockerfile's builder stage). Each target's binary is packaged into a
+  # versioned .tar.gz and uploaded as a workflow artifact for the release
+  # job below.
+  build-binaries:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: mlugg/setup-zig@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build release binary
+        run: cargo zigbuild --release --target ${{ matrix.target }} -p cf-rs
+
+      - name: Package release archive
+        id: package
+        env:
+          VERSION: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          stage="$(mktemp -d)/cf-rs-${VERSION}-${TARGET}"
+          mkdir -p "$stage"
+          cp "target/${TARGET}/release/cf-rs" "$stage/cf-rs"
+          asset="cf-rs-${VERSION}-${TARGET}.tar.gz"
+          tar -czf "$asset" -C "$(dirname "$stage")" "$(basename "$stage")"
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cf-rs-${{ matrix.target }}
+          path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+
+  # Collect every target's archive, generate a combined SHA256SUMS file, and
+  # publish a GitHub Release for the pushed tag with all assets attached.
+  publish-release:
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+
+  # Build and push a multi-arch (amd64 + arm64) container image to GHCR,
+  # reusing the repo-root Dockerfile (its builder stage cross-compiles with
+  # cargo-zigbuild the same way as build-binaries above). The image name is
+  # derived from github.repository rather than hardcoded, since this repo
+  # has no fixed org name yet; it is lowercased because GHCR requires
+  # lowercase image names.
+  publish-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute lowercase image name
+        id: image
+        run: |
+          echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ github.ref_name }}
+            ${{ steps.image.outputs.name }}:latest

@@ -1,0 +1,74 @@
+---
+# Internal, non-public constants for the cf_rs role.
+#
+# Nothing here is documented in
+# specs/001-cloud-functions-local/contracts/ansible-vars.md as a supported
+# override point; treat these as implementation details of this role rather
+# than a stable interface. (They can still be overridden with -e in a
+# pinch, but doing so is unsupported.)
+
+# systemd mode: dedicated system account the service runs as.
+cf_rs_system_user: cf-rs
+cf_rs_system_group: cf-rs
+
+# Where the rendered config.toml lives, both on the systemd host and (via
+# bind mount) inside the docker container. Matches the CLI's own
+# --config/CF_RS_CONFIG resolution order documented in ops-config.md.
+cf_rs_config_dir: /etc/cf-rs
+cf_rs_config_path: /etc/cf-rs/config.toml
+
+# Where the templated unit file is installed. The unit also declares
+# StateDirectory={{ cf_rs_service_name }}, but tasks/install_systemd.yml
+# still explicitly manages cf_rs_data_dir's ownership/mode itself instead
+# of relying solely on that, so a custom (non-default) cf_rs_data_dir is
+# handled the same way as the default one.
+cf_rs_systemd_unit_path: "/etc/systemd/system/{{ cf_rs_service_name }}.service"
+
+# runtime.cgroup in config.toml.j2: cgroup v2 delegation is meaningless
+# inside a docker container (the container never gets write access to the
+# host cgroup tree), so default it off there and on ("auto") under
+# systemd. Not exposed as a public variable because ops-config.md's
+# Docker section already prescribes this as the fixed default for
+# container images, not a per-deploy knob.
+cf_rs_runtime_cgroup: "{{ 'off' if cf_rs_deploy_mode == 'docker' else 'auto' }}"
+
+# Release asset architecture identifier, keyed by ansible_architecture.
+# The contract only specifies cf_rs_checksum_url's SHA256SUMS layout, not
+# the release asset's own filename scheme, so "cf-rs-linux-<arch>" below
+# is a judgment call, not something the contract mandates.
+cf_rs_arch_map:
+  x86_64: x86_64
+  amd64: x86_64
+  aarch64: aarch64
+  arm64: aarch64
+
+cf_rs_release_arch: "{{ cf_rs_arch_map[ansible_facts.architecture] | default(ansible_facts.architecture) }}"
+cf_rs_release_asset: "cf-rs-linux-{{ cf_rs_release_arch }}"
+cf_rs_release_url: "{{ cf_rs_release_base_url }}/v{{ cf_rs_version }}/{{ cf_rs_release_asset }}"
+
+# ops-config.md's "Docker integration" section fixes the image's own
+# VOLUME mount point at /data. cf_rs_data_dir (a public variable) is the
+# *host*-side directory bind-mounted onto that path in docker mode, so the
+# rendered config.toml's storage.data_dir must be this fixed in-container
+# path rather than cf_rs_data_dir itself when cf_rs_deploy_mode == docker.
+# Under systemd there is no such indirection: cf_rs_data_dir is used
+# as-is, since cf-rs runs directly on the host.
+cf_rs_container_data_dir: /data
+cf_rs_config_storage_data_dir: "{{ cf_rs_data_dir if cf_rs_deploy_mode == 'systemd' else cf_rs_container_data_dir }}"
+
+# Same indirection applies to the listen addresses. Under docker, a
+# process inside the container network namespace must bind 0.0.0.0 (the
+# container's own "all interfaces") for Docker's host port-publish DNAT
+# to be able to reach it at all - binding to a host-meaningful address
+# like 127.0.0.1 or a host NIC's IP would make it unreachable from
+# *outside* the container even after publishing, since docker's port
+# forwarding arrives on the container's bridge interface, never its
+# loopback. cf_rs_invoke_bind_address / cf_rs_admin_bind_address instead
+# become the *host*-side publish bind address (see
+# tasks/verify.yml's published_ports), which is what actually
+# controls external reachability in docker mode - and is also what makes
+# tasks/verify.yml's http://127.0.0.1:{{ cf_rs_admin_port }}/readyz check
+# (run from the target host, per the contract) work identically in both
+# modes.
+cf_rs_config_invoke_listen: "{{ cf_rs_invoke_bind_address if cf_rs_deploy_mode == 'systemd' else '0.0.0.0' }}:{{ cf_rs_invoke_port }}"
+cf_rs_config_admin_listen: "{{ cf_rs_admin_bind_address if cf_rs_deploy_mode == 'systemd' else '0.0.0.0' }}:{{ cf_rs_admin_port }}"

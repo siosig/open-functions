@@ -1,0 +1,96 @@
+---
+# Molecule "prepare" stage: build real cf-rs release artifacts from this
+# repo's own checked-out source and stage them where converge.yml's
+# instances can reach them, once - `molecule test`'s sequence runs
+# `prepare` a single time, right after `create` and before `converge`, and
+# (unlike converge.yml) it is *not* re-run by the `idempotence` step, so
+# building here never affects the changed=0 idempotence assertion.
+#
+# Why build instead of pointing at github.com/GHCR: cf_rs_release_base_url
+# / cf_rs_checksum_url / cf_rs_image (see ../../defaults/main.yml) all
+# assume a real published GitHub Release exists to fetch from - this repo
+# has no tagged release yet, so the role's real install_systemd.yml /
+# install_docker.yml fetch logic would simply fail against the live
+# internet. Building the actual binary/image from source here and
+# pointing cf_rs_release_base_url at a file:// path (systemd mode) / a
+# locally-tagged image (docker mode) - see molecule.yml's host_vars - lets
+# this scenario exercise the role's *real* fetch/validate/run logic
+# end-to-end (get_url + checksum, `check-config` validation, `docker run`)
+# rather than stubbing it out.
+- name: Build local cf-rs release artifacts for Molecule testing
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  # By the time `prepare` runs, `create` has already started both
+  # instances with this same host path bind-mounted in (see molecule.yml's
+  # volumes:) - Docker auto-creates a missing bind-mount source directory
+  # as root:root, so this play needs to become root itself to write into
+  # it afterwards.
+  become: true
+  vars:
+    # Keep these three in sync with molecule.yml's host_vars
+    # (cf_rs_release_base_url / cf_rs_version / cf_rs_image /
+    # cf_rs_image_tag) and with converge.yml's docker-load pre_task.
+    cf_rs_molecule_release_dir: /tmp/cf-rs-molecule-release
+    cf_rs_molecule_version: "0.1.0"
+    cf_rs_molecule_image: cf-rs-molecule
+    # ansible/roles/cf_rs/molecule/default -> ansible/roles/cf_rs -> ...
+    # -> repo root (5 directories up from this playbook's own directory).
+    cf_rs_molecule_repo_root: "{{ playbook_dir | dirname | dirname | dirname | dirname | dirname }}"
+  tasks:
+    - name: Create the local release artifact directory
+      ansible.builtin.file:
+        path: "{{ cf_rs_molecule_release_dir }}/v{{ cf_rs_molecule_version }}"
+        state: directory
+        mode: "0755"
+
+    - name: Build the real cf-rs Docker image from this repo's own Dockerfile
+      ansible.builtin.command:
+        cmd: "docker build -t {{ cf_rs_molecule_image }}:{{ cf_rs_molecule_version }} {{ cf_rs_molecule_repo_root }}"
+      changed_when: true
+
+    - name: Create a throwaway container to extract the release binary from
+      ansible.builtin.command:
+        cmd: "docker create {{ cf_rs_molecule_image }}:{{ cf_rs_molecule_version }}"
+      register: cf_rs_molecule_extract_container
+      changed_when: true
+
+    - name: Copy the built binary out of the image (distroless has no shell to exec into)
+      ansible.builtin.command:
+        cmd: >-
+          docker cp
+          {{ cf_rs_molecule_extract_container.stdout | trim }}:/usr/local/bin/cf-rs
+          {{ cf_rs_molecule_release_dir }}/v{{ cf_rs_molecule_version }}/cf-rs-linux-x86_64
+      changed_when: true
+
+    - name: Remove the throwaway container
+      ansible.builtin.command:
+        cmd: "docker rm {{ cf_rs_molecule_extract_container.stdout | trim }}"
+      changed_when: true
+
+    - name: Make the extracted binary executable
+      ansible.builtin.file:
+        path: "{{ cf_rs_molecule_release_dir }}/v{{ cf_rs_molecule_version }}/cf-rs-linux-x86_64"
+        mode: "0755"
+
+    # get_url's checksum parameter, given "sha256:file://...", parses this
+    # exact `<digest>  <filename>` layout (ansible.builtin.get_url's
+    # parse_digest_lines()) - matching the real SHA256SUMS format cf-rs's
+    # own release process is expected to produce.
+    - name: Write SHA256SUMS for the extracted binary
+      ansible.builtin.shell:
+        cmd: sha256sum cf-rs-linux-x86_64 > SHA256SUMS
+        chdir: "{{ cf_rs_molecule_release_dir }}/v{{ cf_rs_molecule_version }}"
+      changed_when: true
+
+    # The docker-mode instance runs its own nested Docker daemon (see
+    # molecule.yml's docker-mode reasoning) with no route to this host's
+    # daemon, so the image has to be handed over as a tar and `docker
+    # load`-ed inside that instance - done in converge.yml's pre_tasks,
+    # once the nested daemon is up.
+    - name: Save the Docker image as a tar for the docker-mode instance's nested daemon
+      ansible.builtin.command:
+        cmd: >-
+          docker save -o {{ cf_rs_molecule_release_dir }}/cf-rs-molecule-image.tar
+          {{ cf_rs_molecule_image }}:{{ cf_rs_molecule_version }}
+      changed_when: true

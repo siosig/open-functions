@@ -1,0 +1,90 @@
+---
+# Provisioning only (user/directories/binary/unit file) - all tagged
+# "install". Enabling and starting the unit lives in tasks/verify.yml
+# instead (tagged "service"), because Type=notify makes `systemctl start`
+# block until cf-rs reports READY=1, which requires config.toml to
+# already exist and be valid; tasks/verify.yml runs after tasks/config.yml
+# for exactly that reason. See the ordering note at the top of
+# tasks/main.yml.
+#
+# All of this assumes the play already has `become: true` for this host
+# (a target-host prerequisite per the contract, not something this role
+# forces).
+
+- name: Create the cf-rs system group
+  ansible.builtin.group:
+    name: "{{ cf_rs_system_group }}"
+    system: true
+    state: present
+  tags:
+    - install
+
+- name: Create the cf-rs system user
+  ansible.builtin.user:
+    name: "{{ cf_rs_system_user }}"
+    group: "{{ cf_rs_system_group }}"
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+    home: "{{ cf_rs_data_dir }}"
+    state: present
+  tags:
+    - install
+
+- name: Create the cf-rs config directory
+  ansible.builtin.file:
+    path: "{{ cf_rs_config_dir }}"
+    state: directory
+    owner: root
+    group: "{{ cf_rs_system_group }}"
+    mode: "0750"
+  tags:
+    - install
+
+- name: Create the cf-rs data directory
+  ansible.builtin.file:
+    path: "{{ cf_rs_data_dir }}"
+    state: directory
+    owner: "{{ cf_rs_system_user }}"
+    group: "{{ cf_rs_system_group }}"
+    mode: "0750"
+  tags:
+    - install
+
+- name: Create configured source directories referenced by BindReadOnlyPaths
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ cf_rs_source_dirs }}"
+  tags:
+    - install
+
+# get_url is idempotent by construction: when `checksum` is given it
+# compares the digest of any existing dest file first and skips the
+# download entirely if it already matches, so a second run is changed=0
+# as long as cf_rs_version (and therefore the release asset) is unchanged.
+- name: Download and verify the cf-rs release binary
+  ansible.builtin.get_url:
+    url: "{{ cf_rs_release_url }}"
+    dest: "{{ cf_rs_binary_path }}"
+    checksum: "sha256:{{ cf_rs_checksum_url }}"
+    owner: root
+    group: root
+    mode: "0755"
+  notify:
+    - restart cf-rs service
+  tags:
+    - install
+
+- name: Template the cf-rs systemd unit
+  ansible.builtin.template:
+    src: cf-rs.service.j2
+    dest: "{{ cf_rs_systemd_unit_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - restart cf-rs service
+  tags:
+    - install

@@ -1,0 +1,60 @@
+---
+- name: Assert cf_rs_deploy_mode is supported
+  ansible.builtin.assert:
+    that:
+      - cf_rs_deploy_mode in ['systemd', 'docker']
+    fail_msg: >-
+      cf_rs_deploy_mode must be "systemd" or "docker", got
+      "{{ cf_rs_deploy_mode }}".
+    quiet: true
+
+- name: Assert cf_rs_admin_token is set when admin listener is not loopback
+  ansible.builtin.assert:
+    that:
+      - cf_rs_admin_token | length > 0
+    fail_msg: >-
+      {% if cf_rs_deploy_mode == 'docker' %}
+      cf_rs_deploy_mode is "docker", so the rendered config.toml's
+      admin.listen is always 0.0.0.0 (see vars/main.yml's
+      cf_rs_config_admin_listen - a process inside the container network
+      namespace has to bind 0.0.0.0 for Docker's port-publish DNAT to
+      reach it at all, regardless of cf_rs_admin_bind_address), which
+      cf-rs's own config schema treats as non-loopback - cf_rs_admin_token
+      is required (Vault-encrypt it in your inventory).
+      {% else %}
+      cf_rs_admin_bind_address ({{ cf_rs_admin_bind_address }}) is not a
+      loopback address, so cf_rs_admin_token is required (Vault-encrypt it
+      in your inventory).
+      {% endif %}
+    quiet: true
+  # docker mode: the *internal* admin.listen written into config.toml is
+  # unconditionally 0.0.0.0 (never cf_rs_admin_bind_address - see
+  # vars/main.yml's cf_rs_config_admin_listen), so `cf-rs check-config`
+  # (tasks/config.yml's validate hook) requires a token there regardless
+  # of cf_rs_admin_bind_address. Checking only cf_rs_admin_bind_address,
+  # as before, let docker-mode deploys reach tasks/config.yml with an
+  # empty token whenever cf_rs_admin_bind_address happened to be loopback
+  # (the default), where they always failed validation - this is caught
+  # here instead, before any provisioning happens.
+  when: >-
+    cf_rs_deploy_mode == 'docker' or
+    cf_rs_admin_bind_address not in ['127.0.0.1', '::1', 'localhost']
+
+- name: Gather target host facts required for preflight checks
+  ansible.builtin.setup:
+    gather_subset:
+      - '!all'
+      - '!min'
+      - distribution
+      - architecture
+  when: ansible_facts.distribution is not defined
+
+- name: Assert the target architecture is supported (systemd mode)
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.architecture in cf_rs_arch_map
+    fail_msg: >-
+      Unsupported target architecture "{{ ansible_facts.architecture }}" -
+      cf-rs releases only ship x86_64 and aarch64 binaries.
+    quiet: true
+  when: cf_rs_deploy_mode == 'systemd'

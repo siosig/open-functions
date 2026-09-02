@@ -1,0 +1,92 @@
+---
+# Public, user-overridable variables for the cf_rs role.
+#
+# This table mirrors specs/001-cloud-functions-local/contracts/ansible-vars.md
+# exactly - that file is the authoritative description of what each variable
+# means and why it defaults the way it does. Keep the two in sync.
+
+# --- Deploy mode -----------------------------------------------------------
+
+# "systemd" | "docker". Anything else fails at preflight.
+cf_rs_deploy_mode: systemd
+
+# Binary / image tag. The contract says this should "track the latest
+# release" by default; pin an explicit version in your inventory for
+# reproducible deploys.
+cf_rs_version: "0.1.0"
+
+# --- Network ----------------------------------------------------------------
+
+cf_rs_invoke_port: 8080
+cf_rs_admin_port: 8081
+
+# If this is not a loopback address, cf_rs_admin_token is required
+# (asserted in tasks/preflight.yml).
+cf_rs_admin_bind_address: 127.0.0.1
+cf_rs_admin_token: ""
+cf_rs_invoke_bind_address: 0.0.0.0
+
+# Hostname-based routing domain, e.g. "fn.example.com". Empty disables it.
+cf_rs_host_suffix: ""
+
+# --- Storage / build ---------------------------------------------------------
+
+cf_rs_data_dir: "{{ '/var/lib/cf-rs' if cf_rs_deploy_mode == 'systemd' else '/srv/cf-rs/data' }}"
+cf_rs_build_mode: "{{ 'auto' if cf_rs_deploy_mode == 'systemd' else 'container' }}"
+
+# When true: the systemd unit gets SupplementaryGroups=docker, and the
+# docker-mode container gets the docker socket bind-mounted plus
+# --group-add <docker gid>. Needed only if functions are registered in
+# build.mode = container / build.mode = auto falling back to container.
+cf_rs_enable_docker: false
+
+# docker mode only: source directories bind-mounted read-only into the
+# container at the same path, so source-mode function registrations can
+# see them.
+cf_rs_source_mounts: []
+
+# systemd mode only: paths added to BindReadOnlyPaths. When empty, the unit
+# uses ProtectHome=read-only instead (see templates/cf-rs.service.j2).
+cf_rs_source_dirs: []
+
+# --- pubsub (ps-rs co-location) ---------------------------------------------
+
+cf_rs_pubsub_base_url: "http://127.0.0.1:8085"
+cf_rs_pubsub_project: local
+# cf-rs's own URL, as seen from ps-rs. Empty lets cf-rs derive it itself.
+cf_rs_pubsub_push_base_url: ""
+
+# --- Shutdown / logging -------------------------------------------------------
+
+cf_rs_shutdown_grace_secs: 30
+
+cf_rs_log_format: "{{ 'journald' if cf_rs_deploy_mode == 'systemd' else 'json' }}"
+cf_rs_log_level: info
+
+# Arbitrary extra config.toml content, merged on top of what this role
+# renders. Keys matching a known section (invoke/admin/storage/build/
+# runtime/defaults/pubsub/log/metrics) are merged into that section;
+# any other top-level key is emitted as a brand new TOML section. Because
+# cf-rs's config schema uses deny_unknown_fields, an unknown section/key
+# here will make `check-config` (run via the template `validate:` hook)
+# fail loudly at deploy time - that is the intended safety net.
+cf_rs_extra_config: {}
+
+# --- Release / binary ---------------------------------------------------------
+
+cf_rs_release_base_url: "https://github.com/example/cf-rs/releases/download"
+cf_rs_checksum_url: "{{ cf_rs_release_base_url }}/v{{ cf_rs_version }}/SHA256SUMS"
+cf_rs_binary_path: /usr/local/bin/cf-rs
+cf_rs_service_name: cf-rs
+
+# --- Docker image -------------------------------------------------------------
+
+cf_rs_image: "ghcr.io/example/cf-rs"
+cf_rs_image_tag: "{{ cf_rs_version }}"
+cf_rs_docker_network: cf-rs
+cf_rs_docker_restart_policy: unless-stopped
+
+# --- Verification ---------------------------------------------------------------
+
+cf_rs_verify: true
+cf_rs_verify_timeout_secs: 60

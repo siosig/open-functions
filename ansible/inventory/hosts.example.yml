@@ -1,0 +1,47 @@
+---
+# Example inventory for ansible/site.yml.
+#
+# Copy this file (e.g. to inventory/hosts.yml, which is gitignored-style
+# local-only convention here — nothing enforces the name) and adjust
+# hostnames, connection details, and per-host variables for your
+# environment. See README.md and roles/cf_rs/defaults/main.yml for the
+# full variable reference.
+#
+# Two example hosts are shown:
+#   - cf-rs-systemd-01: systemd deploy mode, standalone (no ps-rs).
+#   - cf-rs-docker-01:  docker deploy mode, co-located with ps-rs on the
+#                       same host, both containers on the `cf-rs` Docker
+#                       network and addressed by container name. This is
+#                       the standard co-location setup documented in
+#                       specs/001-cloud-functions-local/contracts/ansible-vars.md.
+
+all:
+  children:
+    cf_rs:
+      hosts:
+        # --- systemd mode, standalone -----------------------------------
+        cf-rs-systemd-01:
+          ansible_host: 203.0.113.10
+          ansible_user: ansible
+          cf_rs_deploy_mode: systemd
+          cf_rs_admin_bind_address: 127.0.0.1
+          # cf_rs_source_dirs:
+          #   - /srv/cf-rs/functions
+
+        # --- docker mode, co-located with ps-rs ---------------------------
+        # ps-rs (Pub/Sub-compatible REST API) is deployed separately using
+        # the ps-rs project's own Ansible role/playbook
+        # (~/workspace/siosig/ps-rs), attached to the same `cf_rs_docker_network`
+        # (default: cf-rs) under the container name `ps-rs`. cf-rs is then
+        # able to reach it, and ps-rs is able to push events back to cf-rs,
+        # by container name on that shared network.
+        cf-rs-docker-01:
+          ansible_host: 203.0.113.20
+          ansible_user: ansible
+          cf_rs_deploy_mode: docker
+          cf_rs_docker_network: cf-rs
+          cf_rs_pubsub_base_url: http://ps-rs:8085
+          cf_rs_pubsub_project: local
+          cf_rs_pubsub_push_base_url: http://cf-rs:8080
+          # cf_rs_source_mounts:
+          #   - /srv/cf-rs/functions
