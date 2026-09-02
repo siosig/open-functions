@@ -27,6 +27,10 @@ pub struct InstanceSpec {
     /// Path to the built/copied executable (source/host-cargo path). Unused by
     /// container drivers.
     pub artifact_path: std::path::PathBuf,
+    /// Image reference to run (image-mode / US4). `None` for the
+    /// source/host-cargo path; `Some` for `ContainerDriver`, which ignores
+    /// `artifact_path`.
+    pub image_ref: Option<String>,
 }
 
 /// A running function instance, however it was started.
@@ -88,13 +92,25 @@ pub enum InstanceExit {
 }
 
 /// Starts and readies function instances. Implemented by [`process::ProcessDriver`]
-/// (source/host-cargo path) and, later, a `bollard`-backed container driver (US4).
+/// (source/host-cargo path) and [`container::ContainerDriver`] (image-mode
+/// path, US4).
 #[async_trait::async_trait]
 pub trait Driver: Send + Sync {
     /// Starts one instance and returns once it is ready to accept connections
     /// (per `readiness::wait_ready`), or an error if it fails to become ready
     /// within `spec.start_timeout`.
     async fn spawn(&self, spec: &InstanceSpec) -> Result<InstanceHandle, DriverError>;
+
+    /// Whether this driver's prerequisite runtime is actually reachable right
+    /// now (e.g. the Docker daemon, for `ContainerDriver`). Used at
+    /// image-mode registration time (US4) to reject with a clear
+    /// `FAILED_PRECONDITION` instead of accepting a registration that can
+    /// never successfully start an instance. `ProcessDriver` has no such
+    /// prerequisite beyond the host itself already running this process, so
+    /// the default is unconditionally available.
+    async fn is_available(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

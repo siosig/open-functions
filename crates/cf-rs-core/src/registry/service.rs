@@ -1,12 +1,24 @@
 //! Registry deploy/list/get/delete orchestration (T040, extended by US2's
-//! T053). Ties together `Store` (persistence), `Builder` (source →
-//! artifact), `InstancePool` (running instances), and (for Pub/Sub-triggered
-//! functions) the [`Reconciler`] into the operations
+//! T053 and US4's T075). Ties together `Store` (persistence), `Builder`
+//! (source → artifact), `InstancePool` (running instances), and (for
+//! Pub/Sub-triggered functions) the [`Reconciler`] into the operations
 //! `contracts/admin-api.md`'s admin API exposes.
 //!
-//! Container-image sources / container builds (US4) are modeled in the data
-//! types already but not yet wired up here — `register` rejects
-//! `Source::Image` for now with `RegisterError::Unsupported`.
+//! `Source::Dir` (source-mode) registrations pick a `Builder`
+//! (`host_builder`/`container_builder`) per `build.mode`
+//! (`auto`/`host`/`container`, [`BuildModeSetting`]) and always run their
+//! resulting instances via `process_driver` — the built artifact is a plain
+//! host-runnable executable regardless of where it was compiled.
+//! `Source::Image` (image-mode) registrations skip the build step entirely
+//! (resolve the image's digest instead) and always run via
+//! `container_driver`. Per ops-config.md's "Validation and startup failure" table: an
+//! explicit `build.mode = host`/`container` whose tool is unavailable, or
+//! `auto` with neither available, is rejected at registration time with
+//! `RegisterError::Unsupported` (mapped to `412 FAILED_PRECONDITION` by
+//! `admin.rs`) rather than at `cf-rs serve` startup — this crate's
+//! `RegistryService` has no startup phase of its own to fail during; the
+//! contract's stricter "explicit mode unavailable → refuse to start at all"
+//! behavior belongs to the `cf-rs` binary's own config validation, not here.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,7 +38,22 @@ use crate::model::validate::{self, ValidationError};
 use crate::pool::{InstancePool, PoolConfig, QueuePolicy as PoolQueuePolicy};
 use crate::pubsub::reconcile::{DesiredBinding, Reconciler};
 use crate::registry::store::{Store, StoreError};
+use crate::runtime::docker::{self as docker_helper};
 use crate::runtime::{Driver, InstanceSpec};
+
+/// `build.mode` (`ops-config.md`'s `[build]` section): which `Builder`
+/// source-mode registrations use. Image-mode registrations ignore this
+/// entirely (they never build).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildModeSetting {
+    /// Prefer `host_builder`; fall back to `container_builder` if host
+    /// `cargo` isn't usable; reject with 412 if neither is.
+    Auto,
+    /// Always `host_builder`; reject with 412 if host `cargo` isn't usable.
+    Host,
+    /// Always `container_builder`; reject with 412 if Docker isn't reachable.
+    Container,
+}
 
 /// Pub/Sub-binding configuration, present only when `pubsub.enabled` (the
 /// caller — `cf-rs`'s `serve` — constructs a [`Reconciler`] and this struct
@@ -82,8 +109,12 @@ pub enum RegisterError {
     Validation(#[from] ValidationError),
     #[error(transparent)]
     Store(#[from] StoreError),
-    #[error("source kind not yet supported: {0}")]
-    Unsupported(&'static str),
+    /// A `412 FAILED_PRECONDITION` in `admin.rs`'s mapping: the requested
+    /// registration (source or image mode) can't be fulfilled by anything
+    /// currently available (build tool / Docker daemon), per ops-config.md's
+    /// "Validation and startup failure" table.
+    #[error("precondition not met: {0}")]
+    Unsupported(String),
     #[error("a build for {0:?} is already in progress; retry, or pass force to cancel it")]
     BuildInProgress(String),
     #[error("source path {0:?} does not exist or is not a directory")]
@@ -114,11 +145,24 @@ pub struct RegistryService {
     // the store directly (`list_builds`/`list_functions`/`get_revision`,
     // etc.) without a wrapper method per call.
     pub(crate) store: Arc<dyn Store>,
-    builder: Arc<dyn Builder>,
-    driver: Arc<dyn Driver>,
+    host_builder: Arc<dyn Builder>,
+    container_builder: Arc<dyn Builder>,
+    process_driver: Arc<dyn Driver>,
+    container_driver: Arc<dyn Driver>,
+    build_mode: BuildModeSetting,
+    /// `runtime.docker_socket` from config, reused to connect a fresh
+    /// `bollard::Docker` client for image-mode digest resolution at
+    /// registration time (kept separate from `container_driver`'s own
+    /// internal client so this module doesn't need to downcast the trait
+    /// object to reach it).
+    docker_socket: String,
     global_limit: Arc<Semaphore>,
     artifacts_dir: PathBuf,
     build_dir: PathBuf,
+    /// Shared cargo registry cache (`<data_dir>/cache/cargo`), passed
+    /// through to every `BuildRequest` (host builds ignore it; container
+    /// builds bind-mount it — see `BuildRequest::cache_dir`).
+    cache_dir: PathBuf,
     build_timeout: Duration,
     defaults: RegistrationDefaults,
     pools: Mutex<HashMap<String, Arc<InstancePool>>>,
@@ -137,8 +181,12 @@ impl RegistryService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<dyn Store>,
-        builder: Arc<dyn Builder>,
-        driver: Arc<dyn Driver>,
+        host_builder: Arc<dyn Builder>,
+        container_builder: Arc<dyn Builder>,
+        process_driver: Arc<dyn Driver>,
+        container_driver: Arc<dyn Driver>,
+        build_mode: BuildModeSetting,
+        docker_socket: String,
         global_limit: Arc<Semaphore>,
         data_dir: &Path,
         build_timeout: Duration,
@@ -147,11 +195,16 @@ impl RegistryService {
     ) -> Self {
         Self {
             store,
-            builder,
-            driver,
+            host_builder,
+            container_builder,
+            process_driver,
+            container_driver,
+            build_mode,
+            docker_socket,
             global_limit,
             artifacts_dir: data_dir.join("artifacts"),
             build_dir: data_dir.join("build"),
+            cache_dir: data_dir.join("cache").join("cargo"),
             build_timeout,
             defaults,
             pools: Mutex::new(HashMap::new()),
@@ -215,21 +268,12 @@ impl RegistryService {
         }
     }
 
-    /// Validates and accepts a registration, then builds and deploys it in
-    /// the background. Returns as soon as the request is accepted (structural
+    /// Validates and accepts a registration, then builds (source-mode) or
+    /// resolves the image digest (image-mode) and deploys it in the
+    /// background. Returns as soon as the request is accepted (structural
     /// validation done, no build has necessarily completed yet) — this is the
     /// `202 Accepted` behavior `admin-api.md`'s `PUT` describes.
     pub async fn register(&self, req: RegisterRequest) -> Result<RegisterAccepted, RegisterError> {
-        let Source::Dir { path, bin } = &req.source else {
-            return Err(RegisterError::Unsupported(
-                "source.kind = image (container images land in US4)",
-            ));
-        };
-        let source_path = PathBuf::from(path);
-        if !source_path.is_dir() {
-            return Err(RegisterError::SourceNotFound(source_path));
-        }
-
         {
             let mut building = self.building.lock().await;
             if building.contains(&req.name) {
@@ -238,29 +282,35 @@ impl RegistryService {
             building.insert(req.name.clone());
         }
 
-        let result = self
-            .register_inner(req.clone(), source_path, bin.clone())
-            .await;
+        let result = match req.source.clone() {
+            Source::Dir { path, bin } => {
+                let source_path = PathBuf::from(path);
+                if !source_path.is_dir() {
+                    Err(RegisterError::SourceNotFound(source_path))
+                } else {
+                    self.register_source(req.clone(), source_path, bin).await
+                }
+            }
+            Source::Image { image_ref } => self.register_image(req.clone(), image_ref).await,
+        };
 
         self.building.lock().await.remove(&req.name);
         result
     }
 
-    async fn register_inner(
+    /// Builds the common `Function` record every registration (source- or
+    /// image-mode) produces, from `req` and the previous registration (if
+    /// any) of the same name. Callers still need to `validate_function` and
+    /// `put_function` it themselves — the exact point in each flow where
+    /// that should happen differs slightly (image-mode has no build step in
+    /// between).
+    fn build_function_record(
         &self,
-        req: RegisterRequest,
-        source_path: PathBuf,
-        bin: Option<String>,
-    ) -> Result<RegisterAccepted, RegisterError> {
+        req: &RegisterRequest,
+        existing: Option<&Function>,
+    ) -> Function {
         let now = chrono::Utc::now();
-        let existing = self.store.get_function(&req.name)?;
-        let revision_number = existing
-            .as_ref()
-            .and_then(|f| f.current_revision)
-            .unwrap_or(0)
-            + 1;
-
-        let function = Function {
+        Function {
             name: req.name.clone(),
             trigger: req.trigger.clone(),
             source: req.source.clone(),
@@ -279,6 +329,7 @@ impl RegistryService {
                 .unwrap_or(self.defaults.idle_timeout_secs),
             queue_policy: req
                 .queue_policy
+                .clone()
                 .unwrap_or_else(|| self.defaults.queue_policy.clone()),
             queue_max_wait_secs: req
                 .queue_max_wait_secs
@@ -287,11 +338,73 @@ impl RegistryService {
             // Keep the previous `current_revision` (if any) until the new one
             // is proven ready — a failed re-deploy must leave the old version
             // serving, per FR-007 / plan.md's registry deploy-flow design.
-            current_revision: existing.as_ref().and_then(|f| f.current_revision),
+            current_revision: existing.and_then(|f| f.current_revision),
             last_error: None,
-            created_at: existing.as_ref().map(|f| f.created_at).unwrap_or(now),
+            created_at: existing.map(|f| f.created_at).unwrap_or(now),
             updated_at: now,
-        };
+        }
+    }
+
+    /// Picks the `Builder` for a source-mode registration per `build_mode`,
+    /// probing real tool/daemon availability (not just "was a builder
+    /// constructed" — both builders always are, cheaply, regardless of
+    /// whether their tool is actually usable). Returns
+    /// `RegisterError::Unsupported` (412 `FAILED_PRECONDITION`) if the
+    /// configured mode's tool isn't available, per ops-config.md's
+    /// "Validation and startup failure" table.
+    async fn select_source_builder(&self) -> Result<(&Arc<dyn Builder>, BuildMode), RegisterError> {
+        match self.build_mode {
+            BuildModeSetting::Host => {
+                if self.host_builder.is_available().await {
+                    Ok((&self.host_builder, BuildMode::Host))
+                } else {
+                    Err(RegisterError::Unsupported(
+                        "build.mode = host but the host cargo toolchain is not available"
+                            .to_string(),
+                    ))
+                }
+            }
+            BuildModeSetting::Container => {
+                if self.container_builder.is_available().await {
+                    Ok((&self.container_builder, BuildMode::Container))
+                } else {
+                    Err(RegisterError::Unsupported(
+                        "build.mode = container but the Docker daemon is not reachable".to_string(),
+                    ))
+                }
+            }
+            BuildModeSetting::Auto => {
+                if self.host_builder.is_available().await {
+                    Ok((&self.host_builder, BuildMode::Host))
+                } else if self.container_builder.is_available().await {
+                    Ok((&self.container_builder, BuildMode::Container))
+                } else {
+                    Err(RegisterError::Unsupported(
+                        "build.mode = auto but neither the host cargo toolchain nor the Docker \
+                         daemon is available"
+                            .to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    async fn register_source(
+        &self,
+        req: RegisterRequest,
+        source_path: PathBuf,
+        bin: Option<String>,
+    ) -> Result<RegisterAccepted, RegisterError> {
+        let (builder, build_mode) = self.select_source_builder().await?;
+
+        let existing = self.store.get_function(&req.name)?;
+        let revision_number = existing
+            .as_ref()
+            .and_then(|f| f.current_revision)
+            .unwrap_or(0)
+            + 1;
+
+        let function = self.build_function_record(&req, existing.as_ref());
         validate::validate_function(&function)?;
         self.store.put_function(&function)?;
 
@@ -318,11 +431,11 @@ impl RegistryService {
             id: build_id.clone(),
             function_name: req.name.clone(),
             revision: revision_number,
-            mode: BuildMode::Host,
+            mode: build_mode,
             status: BuildStatus::Running,
             log_path: log_path.to_string_lossy().to_string(),
             exit_code: None,
-            started_at: now,
+            started_at: function.created_at.max(function.updated_at),
             finished_at: None,
         };
         self.store.put_build(&build)?;
@@ -335,10 +448,11 @@ impl RegistryService {
             artifact_path: artifact_path.clone(),
             log_path,
             cargo_target_dir,
+            cache_dir: self.cache_dir.clone(),
             timeout: self.build_timeout,
         };
 
-        let build_outcome = self.builder.build(&build_request).await;
+        let build_outcome = builder.build(&build_request).await;
 
         let mut build_record = build;
         build_record.finished_at = Some(chrono::Utc::now());
@@ -402,6 +516,69 @@ impl RegistryService {
         })
     }
 
+    /// Image-mode registration (US4): no build step — resolves the image's
+    /// content digest via the Docker daemon and activates a revision
+    /// pointing at it directly. Per US4's Independent Test (deploy a real
+    /// `docker build`-produced image and get a working invocation; with the
+    /// Docker daemon stopped, an `--image` registration gets 412 while
+    /// existing source-mode functions keep working): rejects with
+    /// `RegisterError::Unsupported` (412 `FAILED_PRECONDITION`) if the
+    /// Docker daemon isn't reachable, independent of `build.mode`
+    /// (image-mode never builds, so `build.mode` is irrelevant to it).
+    async fn register_image(
+        &self,
+        req: RegisterRequest,
+        image_ref: String,
+    ) -> Result<RegisterAccepted, RegisterError> {
+        if !self.container_driver.is_available().await {
+            return Err(RegisterError::Unsupported(
+                "source.kind = image but the Docker daemon is not reachable".to_string(),
+            ));
+        }
+
+        let docker = docker_helper::connect(&self.docker_socket)
+            .map_err(|err| RegisterError::Unsupported(err.to_string()))?;
+        let digest = resolve_image_digest(&docker, &image_ref)
+            .await
+            .map_err(RegisterError::Unsupported)?;
+
+        let existing = self.store.get_function(&req.name)?;
+        let revision_number = existing
+            .as_ref()
+            .and_then(|f| f.current_revision)
+            .unwrap_or(0)
+            + 1;
+
+        let mut function = self.build_function_record(&req, existing.as_ref());
+        // Image-mode has no build step to wait on: go straight to `ready`.
+        function.state = FunctionState::Ready;
+        function.current_revision = Some(revision_number);
+        validate::validate_function(&function)?;
+        self.store.put_function(&function)?;
+
+        if let Trigger::Pubsub { topic } = &function.trigger {
+            self.bind_pubsub_trigger(&function.name, topic, function.timeout_secs)
+                .await;
+        }
+
+        let revision = Revision {
+            function_name: req.name.clone(),
+            number: revision_number,
+            artifact_path: None,
+            image_digest: Some(digest),
+            build_id: None,
+            snapshot: function,
+            created_at: chrono::Utc::now(),
+        };
+        self.store.put_revision(&revision)?;
+        self.activate_revision(&req.name, &revision).await?;
+
+        Ok(RegisterAccepted {
+            revision: revision_number,
+            build_id: String::new(),
+        })
+    }
+
     /// Builds (or replaces) the `InstancePool` for `name` from a freshly
     /// built `Revision`, atomically switches `current_revision` in the store,
     /// and starts the idle reaper if this is the pool's first activation.
@@ -419,6 +596,15 @@ impl RegistryService {
             .clone()
             .map(PathBuf::from)
             .unwrap_or_default();
+        // Image-mode (US4) instances run via `container_driver` and carry
+        // `image_ref` (ignoring `artifact_path`); source-mode instances run
+        // via `process_driver` and carry `artifact_path` (ignoring
+        // `image_ref`, left `None`) -- the two are mutually exclusive per
+        // `Source`'s own variants, so this single match covers both.
+        let (driver, image_ref): (&Arc<dyn Driver>, Option<String>) = match &f.source {
+            Source::Image { image_ref } => (&self.container_driver, Some(image_ref.clone())),
+            Source::Dir { .. } => (&self.process_driver, None),
+        };
 
         let signature_type: &'static str = match &f.trigger {
             Trigger::Http => "http",
@@ -434,6 +620,7 @@ impl RegistryService {
             memory_mib: f.memory_mib,
             start_timeout: Duration::from_secs(10),
             artifact_path,
+            image_ref,
         };
 
         let pool_config = PoolConfig {
@@ -462,7 +649,7 @@ impl RegistryService {
             None => {
                 let pool = Arc::new(InstancePool::new(
                     name.to_string(),
-                    Arc::clone(&self.driver),
+                    Arc::clone(driver),
                     spec,
                     pool_config,
                     Arc::clone(&self.global_limit),
@@ -562,4 +749,40 @@ impl RegistryService {
 
         Ok(())
     }
+}
+
+/// Resolves `image_ref`'s content digest (`ImageInspect.id`, e.g.
+/// `sha256:...`) for `Revision.image_digest`, per plan.md's "digest resolution" step of the image-mode register flow. Pulls the
+/// image first if it isn't already present locally (`bollard::Docker::
+/// inspect_image` 404), draining the pull stream to completion — the same
+/// "pull if missing" logic `ContainerDriver::spawn` has internally
+/// (duplicated here rather than shared, to avoid depending on a private
+/// helper of a sibling module for a two-call sequence).
+async fn resolve_image_digest(docker: &bollard::Docker, image_ref: &str) -> Result<String, String> {
+    use bollard::query_parameters::CreateImageOptionsBuilder;
+
+    let already_present = docker.inspect_image(image_ref).await;
+    if let Err(bollard::errors::Error::DockerResponseServerError {
+        status_code: 404, ..
+    }) = already_present
+    {
+        let options = CreateImageOptionsBuilder::default()
+            .from_image(image_ref)
+            .build();
+        let mut pull_stream = docker.create_image(Some(options), None, None);
+        use futures_util::StreamExt;
+        while let Some(item) = pull_stream.next().await {
+            item.map_err(|err| format!("failed to pull image {image_ref:?}: {err}"))?;
+        }
+    } else if let Err(err) = already_present {
+        return Err(format!("failed to inspect image {image_ref:?}: {err}"));
+    }
+
+    let inspected = docker
+        .inspect_image(image_ref)
+        .await
+        .map_err(|err| format!("failed to inspect image {image_ref:?} after pull: {err}"))?;
+    inspected
+        .id
+        .ok_or_else(|| format!("image {image_ref:?} has no content digest after inspect"))
 }

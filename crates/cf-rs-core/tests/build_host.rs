@@ -124,6 +124,7 @@ async fn successful_build_produces_executable_artifact_and_log() {
         artifact_path: artifact_path.clone(),
         log_path: log_path.clone(),
         cargo_target_dir,
+        cache_dir: tmp.path().join("cache/cargo"),
         timeout: Duration::from_secs(300),
     };
 
@@ -209,6 +210,7 @@ async fn build_with_compile_error_fails_and_logs_the_error() {
         artifact_path,
         log_path: log_path.clone(),
         cargo_target_dir,
+        cache_dir: tmp.path().join("cache/cargo"),
         timeout: Duration::from_secs(300),
     };
 

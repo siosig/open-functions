@@ -8,14 +8,19 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+use cf_rs_core::build::container::ContainerBuilder;
 use cf_rs_core::build::host_cargo::HostCargoBuilder;
 use cf_rs_core::model::function::QueuePolicy as ModelQueuePolicy;
 use cf_rs_core::pubsub::client::PsRsClient;
 use cf_rs_core::pubsub::reconcile::Reconciler;
 use cf_rs_core::registry::redb_store::RedbStore;
-use cf_rs_core::registry::service::{PubsubBindingConfig, RegistrationDefaults, RegistryService};
+use cf_rs_core::registry::service::{
+    BuildModeSetting, PubsubBindingConfig, RegistrationDefaults, RegistryService,
+};
 use cf_rs_core::resolve::Resolver;
 use cf_rs_core::runtime::cgroup::CgroupLimiter;
+use cf_rs_core::runtime::container::{self, ContainerDriver};
+use cf_rs_core::runtime::docker;
 use cf_rs_core::runtime::process::ProcessDriver;
 use tokio::sync::Semaphore;
 
@@ -72,15 +77,54 @@ pub async fn run(cfg: AppConfig) -> ExitCode {
         queue_max_wait_secs: cfg.defaults.queue_max_wait_secs,
     };
 
-    let builder = Arc::new(HostCargoBuilder {
+    let host_builder = Arc::new(HostCargoBuilder {
         cargo_bin: cfg.build.cargo_bin.clone(),
+    });
+    let container_builder = Arc::new(ContainerBuilder {
+        docker_socket: cfg.runtime.docker_socket.clone(),
     });
     let limiter = Arc::new(if cfg.runtime.cgroup == "off" {
         CgroupLimiter::disabled()
     } else {
         CgroupLimiter::probe()
     });
-    let driver = Arc::new(ProcessDriver { limiter });
+    let process_driver = Arc::new(ProcessDriver { limiter });
+    // `docker::connect` only builds a client (cheap, infallible for a
+    // well-formed socket path) -- it does not itself require a reachable
+    // daemon, so this is safe to construct unconditionally even when
+    // `build.mode = host` and/or the daemon never ends up running.
+    let container_driver = match docker::connect(&cfg.runtime.docker_socket) {
+        Ok(client) => Arc::new(ContainerDriver { docker: client }),
+        Err(err) => {
+            tracing::error!(%err, "failed to construct the Docker client for image-mode support");
+            return ExitCode::from(EXIT_CONFIG_ERROR);
+        }
+    };
+    // Startup sweep of containers cf-rs created and left behind (per
+    // plan.md's ContainerDriver design note) -- best-effort: an unreachable
+    // daemon here just means there's nothing to sweep, not a startup
+    // failure (image-mode functions may simply be unused / build.mode may
+    // not be container/auto).
+    match container::sweep_stale_containers(&container_driver.docker).await {
+        Ok(removed) if removed > 0 => {
+            tracing::info!(
+                removed,
+                "swept stale containers left by an unclean prior shutdown"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(%err, "failed to sweep stale containers at startup (continuing)");
+        }
+    }
+    let build_mode = match cfg.build.mode.as_str() {
+        "host" => BuildModeSetting::Host,
+        "container" => BuildModeSetting::Container,
+        // `config::validate()` already rejects anything but
+        // "auto"/"host"/"container" before `run` is ever reached; treat an
+        // unexpected value the same as "auto" rather than panicking.
+        _ => BuildModeSetting::Auto,
+    };
     let global_limit = Arc::new(Semaphore::new(cfg.runtime.max_total_instances as usize));
 
     let invoke_base_url = if cfg.invoke.public_base_url.is_empty() {
@@ -125,8 +169,12 @@ pub async fn run(cfg: AppConfig) -> ExitCode {
 
     let registry = Arc::new(RegistryService::new(
         store,
-        builder,
-        driver,
+        host_builder,
+        container_builder,
+        process_driver,
+        container_driver,
+        build_mode,
+        cfg.runtime.docker_socket.clone(),
         global_limit,
         &data_dir,
         Duration::from_secs(u64::from(cfg.build.timeout_secs)),

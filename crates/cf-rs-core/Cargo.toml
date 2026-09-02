@@ -20,6 +20,7 @@ tower = { workspace = true }
 
 cloudevents-sdk = { workspace = true, features = ["http-binding"] }
 bollard = { workspace = true }
+futures-util = { workspace = true }
 cgroups-rs = { workspace = true }
 redb = { workspace = true }
 reqwest = { workspace = true }

@@ -514,6 +514,7 @@ dependencies = [
  "cgroups-rs",
  "chrono",
  "cloudevents-sdk",
+ "futures-util",
  "http",
  "http-body-util",
  "hyper",

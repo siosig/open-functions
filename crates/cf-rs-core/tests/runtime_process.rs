@@ -63,6 +63,7 @@ fn base_spec(artifact_path: PathBuf) -> InstanceSpec {
         memory_mib: 128,
         start_timeout: Duration::from_secs(10),
         artifact_path,
+        image_ref: None,
     }
 }
 

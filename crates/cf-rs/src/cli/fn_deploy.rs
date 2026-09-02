@@ -20,8 +20,7 @@ pub struct DeployArgs {
     /// Rust source directory (mutually exclusive with `--image`).
     #[arg(long)]
     source: Option<PathBuf>,
-    /// Container image reference (mutually exclusive with `--source`; not
-    /// yet supported — lands with US4).
+    /// Container image reference (mutually exclusive with `--source`).
     #[arg(long)]
     image: Option<String>,
     #[arg(long)]
@@ -119,6 +118,19 @@ async fn run_async(client: &AdminClient, args: DeployArgs) -> ExitCode {
         }
     };
     let revision = accepted.get("revision").and_then(Value::as_u64);
+
+    // Image-mode registrations have no build step at all (the digest is
+    // resolved synchronously during `register`, per T075) -- the admin API
+    // signals this with an empty `build_id` rather than a real one, since
+    // there's no `Build` record to poll. `--source` deploys always get a
+    // real (non-empty) UUID here.
+    if build_id.is_empty() {
+        let rev = revision
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        println!("Deployed {:?} (revision {rev})", args.name);
+        return ExitCode::from(0);
+    }
 
     if args.no_wait {
         println!("Deploy accepted for {:?} (build {build_id})", args.name);

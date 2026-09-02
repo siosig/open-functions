@@ -17,6 +17,16 @@ pub struct HostCargoBuilder {
 
 #[async_trait::async_trait]
 impl Builder for HostCargoBuilder {
+    async fn is_available(&self) -> bool {
+        Command::new(&self.cargo_bin)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success())
+    }
+
     async fn build(&self, request: &BuildRequest) -> Result<(), BuildError> {
         let source_dir = request.source_dir.clone();
         let requested_bin = request.bin.clone();

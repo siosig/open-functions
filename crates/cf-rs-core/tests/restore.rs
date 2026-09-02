@@ -14,6 +14,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use cf_rs_core::build::container::ContainerBuilder;
 use cf_rs_core::build::host_cargo::HostCargoBuilder;
 use cf_rs_core::model::build::{Build, BuildMode, BuildStatus};
 use cf_rs_core::model::function::{
@@ -21,9 +22,11 @@ use cf_rs_core::model::function::{
 };
 use cf_rs_core::model::revision::Revision;
 use cf_rs_core::registry::redb_store::RedbStore;
-use cf_rs_core::registry::service::{RegistrationDefaults, RegistryService};
+use cf_rs_core::registry::service::{BuildModeSetting, RegistrationDefaults, RegistryService};
 use cf_rs_core::registry::store::Store;
 use cf_rs_core::runtime::cgroup::CgroupLimiter;
+use cf_rs_core::runtime::container::ContainerDriver;
+use cf_rs_core::runtime::docker;
 use cf_rs_core::runtime::process::ProcessDriver;
 
 /// Builds `examples/hello-http` in release mode if not already built, so
@@ -76,18 +79,32 @@ fn defaults() -> RegistrationDefaults {
 fn new_registry(data_dir: &Path) -> (RegistryService, Arc<dyn Store>) {
     let db_path = data_dir.join("meta.redb");
     let store: Arc<dyn Store> = Arc::new(RedbStore::open(&db_path).expect("open redb store"));
-    let builder = Arc::new(HostCargoBuilder {
+    let host_builder = Arc::new(HostCargoBuilder {
         cargo_bin: "cargo".to_string(),
     });
-    let driver = Arc::new(ProcessDriver {
+    // Not exercised by any test in this file (none register an image-mode
+    // function) — constructed anyway since `RegistryService::new` always
+    // needs one; `docker::connect` is infallible even with no daemon
+    // running (see `runtime::docker`'s own doc comments).
+    let container_builder = Arc::new(ContainerBuilder {
+        docker_socket: String::new(),
+    });
+    let process_driver = Arc::new(ProcessDriver {
         limiter: Arc::new(CgroupLimiter::probe()),
+    });
+    let container_driver = Arc::new(ContainerDriver {
+        docker: docker::connect("").expect("connect (no daemon required to construct)"),
     });
     let global_limit = Arc::new(tokio::sync::Semaphore::new(32));
 
     let registry = RegistryService::new(
         Arc::clone(&store),
-        builder,
-        driver,
+        host_builder,
+        container_builder,
+        process_driver,
+        container_driver,
+        BuildModeSetting::Host,
+        String::new(),
         global_limit,
         data_dir,
         Duration::from_secs(1800),
