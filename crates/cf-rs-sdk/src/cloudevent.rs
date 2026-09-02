@@ -20,8 +20,12 @@ pub type CloudEvent = cloudevents::Event;
 /// Errors decoding a [`CloudEvent`]'s `data` payload via [`CloudEventExt::data_as`].
 #[derive(Debug, thiserror::Error)]
 pub enum DataError {
+    /// The event has no `data` field at all (e.g. a CloudEvent carrying
+    /// only attributes, no payload).
     #[error("CloudEvent has no data payload")]
     MissingData,
+    /// The event has a `data` payload, but it either isn't valid JSON or
+    /// doesn't deserialize into the requested type `T`.
     #[error("failed to decode CloudEvent data as JSON: {0}")]
     Decode(#[source] serde_json::Error),
 }
@@ -52,6 +56,11 @@ impl CloudEventExt for CloudEvent {
 /// 'static` (e.g. [`DataError`] from [`CloudEventExt::data_as`], or any `anyhow`-style
 /// boxable error).
 pub trait CloudEventHandler: Clone + Send + Sync + 'static {
+    /// Invoke the handler with the decoded `event`, boxing any returned
+    /// error so this trait stays object-safe-friendly across the SDK's
+    /// generic handler types. Callers normally don't call this directly —
+    /// [`Functions::cloud_event`](crate::Functions::cloud_event) wires it
+    /// into the served router.
     fn call(
         self,
         event: CloudEvent,

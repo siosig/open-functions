@@ -14,14 +14,16 @@ path = "src/main.rs"
 unwrap_used = "warn"
 expect_used = "warn"
 
+# See cf-rs-core/Cargo.toml's matching comment: cargo machete can't see
+# `use cloudevents::...` as a use of the `cloudevents-sdk` package.
+[package.metadata.cargo-machete]
+ignored = ["cloudevents-sdk"]
+
 [dependencies]
 cf-rs-core = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
-hyper = { workspace = true }
 hyper-util = { workspace = true }
-tower = { workspace = true }
-tower-http = { workspace = true, features = ["trace"] }
 http = { workspace = true }
 cloudevents-sdk = { workspace = true }
 futures-util = { workspace = true }

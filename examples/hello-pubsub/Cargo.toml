@@ -10,6 +10,9 @@ publish = false
 # `cargo build` this directory standalone (the same path cf-rs's host-cargo
 # Builder takes), and that it depends on cf-rs-sdk the same way an external
 # consumer would (a path dependency here; a crates.io version once published).
+[package.metadata.cargo-machete]
+ignored = ["cloudevents-sdk"]
+
 [dependencies]
 cf-rs-sdk = { path = "../../crates/cf-rs-sdk" }
 cloudevents-sdk = "0.9.0"

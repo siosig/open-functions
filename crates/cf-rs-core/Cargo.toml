@@ -10,13 +10,16 @@ repository.workspace = true
 unwrap_used = "warn"
 expect_used = "warn"
 
+# `cloudevents-sdk`'s own crate/lib name is `cloudevents` (see its
+# Cargo.toml's `[lib] name = "cloudevents"`), so `cargo machete`'s
+# name-based usage scan can't see `use cloudevents::...` as a use of this
+# package and flags it as unused -- it is not; see pubsub/convert.rs.
+[package.metadata.cargo-machete]
+ignored = ["cloudevents-sdk"]
+
 [dependencies]
 tokio = { workspace = true }
-hyper = { workspace = true }
-hyper-util = { workspace = true }
 http = { workspace = true }
-http-body-util = { workspace = true }
-tower = { workspace = true }
 
 cloudevents-sdk = { workspace = true, features = ["http-binding"] }
 bollard = { workspace = true }

@@ -10,6 +10,11 @@ repository.workspace = true
 unwrap_used = "warn"
 expect_used = "warn"
 
+# See cf-rs-core/Cargo.toml's matching comment: cargo machete can't see
+# `use cloudevents::...` as a use of the `cloudevents-sdk` package.
+[package.metadata.cargo-machete]
+ignored = ["cloudevents-sdk"]
+
 [dependencies]
 tokio = { workspace = true }
 axum = { workspace = true }
