@@ -3,3 +3,6 @@
 /.specify/
 /specs/
 /CLAUDE.md/
+
+# secretlint local-only denylist (company/personal terms — never committed)
+.secretlintrc.local.json
