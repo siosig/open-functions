@@ -1,12 +1,12 @@
-# Default configuration baked into the cf-rs Docker image at
-# /etc/cf-rs/config.toml (see Dockerfile). Every field below overrides the
-# built-in default documented in crates/cf-rs/src/config.rs /
+# Default configuration baked into the open-functions Docker image at
+# /etc/open-functions/config.toml (see Dockerfile). Every field below overrides the
+# built-in default documented in crates/open-functions/src/config.rs /
 # specs/001-cloud-functions-local/contracts/ops-config.md; every field the
 # built-in default already matches container conventions (e.g. invoke.listen
 # = "0.0.0.0:8080") is intentionally left out so it is inherited unchanged.
 #
 # This file ships with the image; it is not meant to be hand-edited in
-# place. Override individual values at runtime with CF_RS__<SECTION>__<KEY>
+# place. Override individual values at runtime with OPEN_FUNCTIONS__<SECTION>__<KEY>
 # environment variables (double underscore = section separator), or replace
 # the whole file with a bind mount / a custom image layer.
 
@@ -18,8 +18,8 @@ data_dir = "/data"
 # Loopback-only by default so the admin API is not reachable outside the
 # container unless the operator explicitly republishes it. To expose it,
 # override both of these via environment variables:
-#   CF_RS__ADMIN__LISTEN=0.0.0.0:8081
-#   CF_RS__ADMIN__TOKEN=<bearer token>
+#   OPEN_FUNCTIONS__ADMIN__LISTEN=0.0.0.0:8081
+#   OPEN_FUNCTIONS__ADMIN__TOKEN=<bearer token>
 listen = "127.0.0.1:8081"
 
 [build]
@@ -33,5 +33,5 @@ mode = "container"
 # cgroup v2 is not writable inside a Docker container in the typical case
 # (no --cgroupns=host / delegated controllers). Setting this to "off" here
 # suppresses the cgroup-unavailable startup warning; memory limits per
-# function instance are simply not enforced by cf-rs itself in that case.
+# function instance are simply not enforced by open-functions itself in that case.
 cgroup = "off"

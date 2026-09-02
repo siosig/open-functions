@@ -1,0 +1,65 @@
+[package]
+name = "open-functions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Google Cloud Run functions compatible local function host"
+repository.workspace = true
+
+[[bin]]
+name = "open-functions"
+path = "src/main.rs"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+# See open-functions-core/Cargo.toml's matching comment: cargo machete can't see
+# `use cloudevents::...` as a use of the `cloudevents-sdk` package.
+[package.metadata.cargo-machete]
+ignored = ["cloudevents-sdk"]
+
+[dependencies]
+open-functions-core = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+hyper-util = { workspace = true }
+http = { workspace = true }
+cloudevents-sdk = { workspace = true }
+futures-util = { workspace = true }
+
+config = { workspace = true }
+clap = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-journald = { workspace = true }
+
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+sd-notify = { workspace = true }
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+base64 = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "forward"
+harness = false
+required-features = ["bench"]
+
+[dependencies.criterion]
+workspace = true
+optional = true
+
+[features]
+bench = ["dep:criterion"]

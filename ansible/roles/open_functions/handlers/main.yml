@@ -1,0 +1,19 @@
+---
+- name: Restart open-functions service
+  ansible.builtin.systemd_service:
+    name: "{{ open_functions_service_name }}"
+    state: restarted
+    daemon_reload: true
+  listen: restart open-functions service
+
+# Minimal invocation on purpose: community.docker.docker_container only
+# compares/enforces parameters that are actually supplied, so passing just
+# `name` + `restart: true` restarts the existing container (created with
+# its full parameter set in tasks/verify.yml) without re-evaluating - and
+# risking a spurious recreation from - every other option.
+- name: Restart open-functions container
+  community.docker.docker_container:
+    name: "{{ open_functions_service_name }}"
+    state: started
+    restart: true
+  listen: restart open-functions container

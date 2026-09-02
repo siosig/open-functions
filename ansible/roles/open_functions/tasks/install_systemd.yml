@@ -1,0 +1,90 @@
+---
+# Provisioning only (user/directories/binary/unit file) - all tagged
+# "install". Enabling and starting the unit lives in tasks/verify.yml
+# instead (tagged "service"), because Type=notify makes `systemctl start`
+# block until open-functions reports READY=1, which requires config.toml to
+# already exist and be valid; tasks/verify.yml runs after tasks/config.yml
+# for exactly that reason. See the ordering note at the top of
+# tasks/main.yml.
+#
+# All of this assumes the play already has `become: true` for this host
+# (a target-host prerequisite per the contract, not something this role
+# forces).
+
+- name: Create the open-functions system group
+  ansible.builtin.group:
+    name: "{{ open_functions_system_group }}"
+    system: true
+    state: present
+  tags:
+    - install
+
+- name: Create the open-functions system user
+  ansible.builtin.user:
+    name: "{{ open_functions_system_user }}"
+    group: "{{ open_functions_system_group }}"
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+    home: "{{ open_functions_data_dir }}"
+    state: present
+  tags:
+    - install
+
+- name: Create the open-functions config directory
+  ansible.builtin.file:
+    path: "{{ open_functions_config_dir }}"
+    state: directory
+    owner: root
+    group: "{{ open_functions_system_group }}"
+    mode: "0750"
+  tags:
+    - install
+
+- name: Create the open-functions data directory
+  ansible.builtin.file:
+    path: "{{ open_functions_data_dir }}"
+    state: directory
+    owner: "{{ open_functions_system_user }}"
+    group: "{{ open_functions_system_group }}"
+    mode: "0750"
+  tags:
+    - install
+
+- name: Create configured source directories referenced by BindReadOnlyPaths
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ open_functions_source_dirs }}"
+  tags:
+    - install
+
+# get_url is idempotent by construction: when `checksum` is given it
+# compares the digest of any existing dest file first and skips the
+# download entirely if it already matches, so a second run is changed=0
+# as long as open_functions_version (and therefore the release asset) is unchanged.
+- name: Download and verify the open-functions release binary
+  ansible.builtin.get_url:
+    url: "{{ open_functions_release_url }}"
+    dest: "{{ open_functions_binary_path }}"
+    checksum: "sha256:{{ open_functions_checksum_url }}"
+    owner: root
+    group: root
+    mode: "0755"
+  notify:
+    - restart open-functions service
+  tags:
+    - install
+
+- name: Template the open-functions systemd unit
+  ansible.builtin.template:
+    src: open-functions.service.j2
+    dest: "{{ open_functions_systemd_unit_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - restart open-functions service
+  tags:
+    - install

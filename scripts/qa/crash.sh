@@ -8,7 +8,7 @@
 # to spawn a fresh, working instance the next time the crashed function is
 # called.
 #
-# This script starts a real `cf-rs serve` process against a throwaway
+# This script starts a real `open-functions serve` process against a throwaway
 # --data-dir and deploys TWO functions from examples/hello-http: "stable"
 # (deployed normally) and "crasher" (deployed with CRASH=1, which per
 # examples/hello-http/src/main.rs makes the handler call
@@ -18,9 +18,9 @@
 #   1. call crasher once -- the instance accepts the connection (spawn
 #      succeeds; CRASH=1 only fires inside the request handler, per
 #      hello-http's own doc comment) and then dies mid-response. Per
-#      crates/cf-rs-core/src/forward/mod.rs's ForwardFailure -> status
-#      mapping (confirmed against crates/cf-rs-core/src/pool/instance.rs's
-#      "Crash detection design" doc and crates/cf-rs/src/forward.rs's
+#      crates/open-functions-core/src/forward/mod.rs's ForwardFailure -> status
+#      mapping (confirmed against crates/open-functions-core/src/pool/instance.rs's
+#      "Crash detection design" doc and crates/open-functions/src/forward.rs's
 #      is_connect()-based classification), a connection that was accepted
 #      but dropped mid-response classifies as ConnectionReset, which maps to
 #      HTTP 500 (INTERNAL) -- NOT 502 (502/ConnectionRefused is reserved for
@@ -48,10 +48,10 @@ calls it again, asserting 200 -- proving the pool restarts a fresh instance
 on the next call after a crash.
 
 Environment variables:
-  CF_RS_BIN             Path to the cf-rs binary. Defaults to
-                        $CARGO_TARGET_DIR/release/cf-rs if CARGO_TARGET_DIR
-                        is set, else <repo_root>/target/release/cf-rs. Built
-                        via `cargo build --release -p cf-rs` first if
+  OPEN_FUNCTIONS_BIN             Path to the open-functions binary. Defaults to
+                        $CARGO_TARGET_DIR/release/open-functions if CARGO_TARGET_DIR
+                        is set, else <repo_root>/target/release/open-functions. Built
+                        via `cargo build --release -p open-functions` first if
                         missing.
   ADMIN_PORT            Admin API port to bind (default 19185).
   INVOKE_PORT           Invoke listener port to bind (default 19184).
@@ -97,21 +97,21 @@ fail() {
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 
-if [[ -n "${CF_RS_BIN:-}" ]]; then
+if [[ -n "${OPEN_FUNCTIONS_BIN:-}" ]]; then
   : # explicit override wins
 elif [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-  CF_RS_BIN="${CARGO_TARGET_DIR}/release/cf-rs"
+  OPEN_FUNCTIONS_BIN="${CARGO_TARGET_DIR}/release/open-functions"
 else
-  CF_RS_BIN="$REPO_ROOT/target/release/cf-rs"
+  OPEN_FUNCTIONS_BIN="$REPO_ROOT/target/release/open-functions"
 fi
 
-if [[ ! -x "$CF_RS_BIN" ]]; then
-  log "cf-rs binary not found at $CF_RS_BIN, building it first (cargo build --release -p cf-rs)..."
-  (cd "$REPO_ROOT" && cargo build --release -p cf-rs) \
-    || fail "cargo build --release -p cf-rs failed"
-  [[ -x "$CF_RS_BIN" ]] || fail "cf-rs binary still missing at $CF_RS_BIN after building"
+if [[ ! -x "$OPEN_FUNCTIONS_BIN" ]]; then
+  log "open-functions binary not found at $OPEN_FUNCTIONS_BIN, building it first (cargo build --release -p open-functions)..."
+  (cd "$REPO_ROOT" && cargo build --release -p open-functions) \
+    || fail "cargo build --release -p open-functions failed"
+  [[ -x "$OPEN_FUNCTIONS_BIN" ]] || fail "open-functions binary still missing at $OPEN_FUNCTIONS_BIN after building"
 fi
-log "Using cf-rs binary: $CF_RS_BIN"
+log "Using open-functions binary: $OPEN_FUNCTIONS_BIN"
 
 HELLO_HTTP_DIR="$REPO_ROOT/examples/hello-http"
 [[ -d "$HELLO_HTTP_DIR" ]] || fail "examples/hello-http not found at $HELLO_HTTP_DIR"
@@ -141,14 +141,14 @@ if port_in_use "$INVOKE_PORT"; then
   fail "INVOKE_PORT ${INVOKE_PORT} is already in use on 127.0.0.1; set INVOKE_PORT to a free port"
 fi
 
-DATA_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cf-rs-crash.XXXXXX")
+DATA_DIR=$(mktemp -d "${TMPDIR:-/tmp}/open-functions-crash.XXXXXX")
 SERVE_PID=""
 
 cleanup() {
   local ec=$?
   set +e
   if [[ -n "$SERVE_PID" ]] && kill -0 "$SERVE_PID" 2>/dev/null; then
-    log "cleanup: stopping cf-rs serve (pid $SERVE_PID)"
+    log "cleanup: stopping open-functions serve (pid $SERVE_PID)"
     kill "$SERVE_PID" 2>/dev/null
     wait "$SERVE_PID" 2>/dev/null
   fi
@@ -179,10 +179,10 @@ http_call() {
   # http_call METHOD URL [JSON_BODY]
   # On return, sets HTTP_STATUS and HTTP_BODY. Fails loudly (does not return)
   # if curl itself cannot complete the request (connection error/timeout).
-  # Note: this is a call to cf-rs's own listener, which always terminates the
+  # Note: this is a call to open-functions's own listener, which always terminates the
   # request with a real HTTP response (even a crashed backend instance is
-  # translated into a status code by cf-rs's forwarder) -- so this only fires
-  # for genuine cf-rs-level connectivity problems, not backend crashes.
+  # translated into a status code by open-functions's forwarder) -- so this only fires
+  # for genuine open-functions-level connectivity problems, not backend crashes.
   local method="$1" url="$2" data="${3:-}"
   local tmp
   tmp=$(mktemp)
@@ -212,7 +212,7 @@ expect_status() {
 }
 
 start_serve() {
-  "$CF_RS_BIN" serve \
+  "$OPEN_FUNCTIONS_BIN" serve \
     --data-dir "$DATA_DIR" \
     --invoke-listen "127.0.0.1:${INVOKE_PORT}" \
     --admin-listen "127.0.0.1:${ADMIN_PORT}" \
@@ -261,11 +261,11 @@ deploy_function() {
   wait_for_function_ready "$fn_name" "$DEPLOY_TIMEOUT_SECS"
 }
 
-log "Starting cf-rs serve: data-dir=$DATA_DIR invoke=$INVOKE_URL admin=$ADMIN_URL"
+log "Starting open-functions serve: data-dir=$DATA_DIR invoke=$INVOKE_URL admin=$ADMIN_URL"
 start_serve
 wait_for_ready "$READY_TIMEOUT_SECS" \
-  || fail "cf-rs serve (pid $SERVE_PID) did not become ready within ${READY_TIMEOUT_SECS}s. Log: $DATA_DIR/serve.log"
-log "cf-rs serve is ready (pid $SERVE_PID)"
+  || fail "open-functions serve (pid $SERVE_PID) did not become ready within ${READY_TIMEOUT_SECS}s. Log: $DATA_DIR/serve.log"
+log "open-functions serve is ready (pid $SERVE_PID)"
 
 log "Deploying $STABLE_FN from $HELLO_HTTP_DIR (normal env; this triggers a real cold build and may take a few minutes)"
 deploy_function "$STABLE_FN" '{}'

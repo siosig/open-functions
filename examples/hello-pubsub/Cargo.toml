@@ -7,14 +7,14 @@ edition = "2024"
 publish = false
 
 # Deliberately NOT a workspace member: this proves a function author can
-# `cargo build` this directory standalone (the same path cf-rs's host-cargo
-# Builder takes), and that it depends on cf-rs-sdk the same way an external
+# `cargo build` this directory standalone (the same path open-functions's host-cargo
+# Builder takes), and that it depends on open-functions-sdk the same way an external
 # consumer would (a path dependency here; a crates.io version once published).
 [package.metadata.cargo-machete]
 ignored = ["cloudevents-sdk"]
 
 [dependencies]
-cf-rs-sdk = { path = "../../crates/cf-rs-sdk" }
+open-functions-sdk = { path = "../../crates/open-functions-sdk" }
 cloudevents-sdk = "0.9.0"
 thiserror = "2.0.20"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

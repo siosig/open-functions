@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/cf-rs-sdk", "crates/cf-rs-core", "crates/cf-rs"]
+members = ["crates/open-functions-sdk", "crates/open-functions-core", "crates/open-functions"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/example/cf-rs"
+repository = "https://github.com/siosig/open-functions"
 
 [workspace.dependencies]
-cf-rs-sdk = { path = "crates/cf-rs-sdk" }
-cf-rs-core = { path = "crates/cf-rs-core" }
+open-functions-sdk = { path = "crates/open-functions-sdk" }
+open-functions-core = { path = "crates/open-functions-core" }
 
 tokio = { version = "1.53", features = ["full"] }
 axum = "0.8.9"

@@ -1,0 +1,92 @@
+---
+# Public, user-overridable variables for the open_functions role.
+#
+# This table mirrors specs/001-cloud-functions-local/contracts/ansible-vars.md
+# exactly - that file is the authoritative description of what each variable
+# means and why it defaults the way it does. Keep the two in sync.
+
+# --- Deploy mode -----------------------------------------------------------
+
+# "systemd" | "docker". Anything else fails at preflight.
+open_functions_deploy_mode: systemd
+
+# Binary / image tag. The contract says this should "track the latest
+# release" by default; pin an explicit version in your inventory for
+# reproducible deploys.
+open_functions_version: "0.1.0"
+
+# --- Network ----------------------------------------------------------------
+
+open_functions_invoke_port: 8080
+open_functions_admin_port: 8081
+
+# If this is not a loopback address, open_functions_admin_token is required
+# (asserted in tasks/preflight.yml).
+open_functions_admin_bind_address: 127.0.0.1
+open_functions_admin_token: ""
+open_functions_invoke_bind_address: 0.0.0.0
+
+# Hostname-based routing domain, e.g. "fn.example.com". Empty disables it.
+open_functions_host_suffix: ""
+
+# --- Storage / build ---------------------------------------------------------
+
+open_functions_data_dir: "{{ '/var/lib/open-functions' if open_functions_deploy_mode == 'systemd' else '/srv/open-functions/data' }}"
+open_functions_build_mode: "{{ 'auto' if open_functions_deploy_mode == 'systemd' else 'container' }}"
+
+# When true: the systemd unit gets SupplementaryGroups=docker, and the
+# docker-mode container gets the docker socket bind-mounted plus
+# --group-add <docker gid>. Needed only if functions are registered in
+# build.mode = container / build.mode = auto falling back to container.
+open_functions_enable_docker: false
+
+# docker mode only: source directories bind-mounted read-only into the
+# container at the same path, so source-mode function registrations can
+# see them.
+open_functions_source_mounts: []
+
+# systemd mode only: paths added to BindReadOnlyPaths. When empty, the unit
+# uses ProtectHome=read-only instead (see templates/open-functions.service.j2).
+open_functions_source_dirs: []
+
+# --- pubsub (ps-rs co-location) ---------------------------------------------
+
+open_functions_pubsub_base_url: "http://127.0.0.1:8085"
+open_functions_pubsub_project: local
+# open-functions's own URL, as seen from ps-rs. Empty lets open-functions derive it itself.
+open_functions_pubsub_push_base_url: ""
+
+# --- Shutdown / logging -------------------------------------------------------
+
+open_functions_shutdown_grace_secs: 30
+
+open_functions_log_format: "{{ 'journald' if open_functions_deploy_mode == 'systemd' else 'json' }}"
+open_functions_log_level: info
+
+# Arbitrary extra config.toml content, merged on top of what this role
+# renders. Keys matching a known section (invoke/admin/storage/build/
+# runtime/defaults/pubsub/log/metrics) are merged into that section;
+# any other top-level key is emitted as a brand new TOML section. Because
+# open-functions's config schema uses deny_unknown_fields, an unknown section/key
+# here will make `check-config` (run via the template `validate:` hook)
+# fail loudly at deploy time - that is the intended safety net.
+open_functions_extra_config: {}
+
+# --- Release / binary ---------------------------------------------------------
+
+open_functions_release_base_url: "https://github.com/siosig/open-functions/releases/download"
+open_functions_checksum_url: "{{ open_functions_release_base_url }}/v{{ open_functions_version }}/SHA256SUMS"
+open_functions_binary_path: /usr/local/bin/open-functions
+open_functions_service_name: open-functions
+
+# --- Docker image -------------------------------------------------------------
+
+open_functions_image: "ghcr.io/siosig/open-functions"
+open_functions_image_tag: "{{ open_functions_version }}"
+open_functions_docker_network: open-functions
+open_functions_docker_restart_policy: unless-stopped
+
+# --- Verification ---------------------------------------------------------------
+
+open_functions_verify: true
+open_functions_verify_timeout_secs: 60

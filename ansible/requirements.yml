@@ -1,12 +1,12 @@
 ---
-# Ansible Galaxy collection requirements for deploying cf-rs.
+# Ansible Galaxy collection requirements for deploying open-functions.
 #
 # Install with:
 #   ansible-galaxy collection install -r requirements.yml
 #
-# community.docker is required by the cf_rs role's Docker deploy mode
+# community.docker is required by the open_functions role's Docker deploy mode
 # (community.docker.docker_container, community.docker.docker_network).
-# It is only exercised when cf_rs_deploy_mode=docker, but is listed
+# It is only exercised when open_functions_deploy_mode=docker, but is listed
 # unconditionally so a single `ansible-galaxy collection install -r
 # requirements.yml` prepares the control node for either mode.
 collections:

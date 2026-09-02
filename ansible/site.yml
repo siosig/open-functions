@@ -1,38 +1,38 @@
 ---
-# Top-level playbook for deploying cf-rs.
+# Top-level playbook for deploying open-functions.
 #
 # Usage:
-#   ansible-playbook -i inventory/hosts.yml site.yml -e cf_rs_deploy_mode=systemd
-#   ansible-playbook -i inventory/hosts.yml site.yml -e cf_rs_deploy_mode=docker
+#   ansible-playbook -i inventory/hosts.yml site.yml -e open_functions_deploy_mode=systemd
+#   ansible-playbook -i inventory/hosts.yml site.yml -e open_functions_deploy_mode=docker
 #
 # See README.md for prerequisites and the full variable reference
-# (roles/cf_rs/defaults/main.yml), and inventory/hosts.example.yml for
-# a starting inventory, including the standard cf-rs + ps-rs co-location
+# (roles/open_functions/defaults/main.yml), and inventory/hosts.example.yml for
+# a starting inventory, including the standard open-functions + ps-rs co-location
 # example in Docker mode.
 #
-# Tag reference (see the cf_rs role): preflight, install, config, service,
+# Tag reference (see the open_functions role): preflight, install, config, service,
 # verify. Example: `--tags config,service` pushes a config change and
 # restarts the service without re-running install/verify.
 
-- name: Deploy cf-rs
-  hosts: cf_rs
+- name: Deploy open-functions
+  hosts: open_functions
   become: true
   gather_facts: true
 
   # The standard co-located setup runs ps-rs (Pub/Sub-compatible REST API,
-  # ports 8085/8086) alongside cf-rs (8080/8081) on the same host, with
-  # cf_rs_pubsub_base_url pointing at it. ps-rs's own Ansible role (ps_rs)
+  # ports 8085/8086) alongside open-functions (8080/8081) on the same host, with
+  # open_functions_pubsub_base_url pointing at it. ps-rs's own Ansible role (ps_rs)
   # lives in the separate ps-rs project (~/workspace/siosig/ps-rs), not in
   # this repository, so it is not declared here. If that project's role is
   # vendored into this repo (e.g. under ansible/roles/ps_rs) or pulled in
   # via a separate `requirements.yml` role/collection entry, apply it before
-  # cf_rs by uncommenting a block like:
+  # open_functions by uncommenting a block like:
   #
   # roles:
   #   - role: ps_rs
-  #   - role: cf_rs
+  #   - role: open_functions
   #
-  # Without that, apply only cf_rs here and run the ps-rs project's own
+  # Without that, apply only open_functions here and run the ps-rs project's own
   # playbook separately against the same host/inventory.
   roles:
-    - role: cf_rs
+    - role: open_functions

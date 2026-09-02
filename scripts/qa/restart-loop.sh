@@ -6,20 +6,20 @@
 # container 100 times must not lose a single registered function's
 # definition or build artifact, and must not trigger a rebuild."
 #
-# This script starts a real `cf-rs serve` process against a throwaway
+# This script starts a real `open-functions serve` process against a throwaway
 # --data-dir, deploys examples/hello-http as a real (source-mode) function,
 # then repeatedly:
-#   1. sends SIGTERM to the running `cf-rs serve` process (the same signal
+#   1. sends SIGTERM to the running `open-functions serve` process (the same signal
 #      the graceful-shutdown contract expects) and waits for it to actually
 #      exit,
-#   2. relaunches `cf-rs serve` with the *same* --data-dir and ports,
+#   2. relaunches `open-functions serve` with the *same* --data-dir and ports,
 #   3. waits for /readyz, then re-checks every invariant below against the
 #      baseline captured right after the initial deploy:
 #        - the number of registered functions (GET /v1/functions)
 #        - the function's current_revision (GET /v1/functions/<name>)
 #        - the SHA256 of the on-disk build artifact
 #          (<data-dir>/artifacts/<name>/<revision>/function)
-#        - the Prometheus cf_rs_builds_total counter, summed across all of
+#        - the Prometheus open_functions_builds_total counter, summed across all of
 #          its label combinations (GET /metrics)
 #
 # Any mismatch fails the script immediately with a diagnostic naming the
@@ -30,12 +30,12 @@ usage() {
   cat <<'EOF'
 Usage: scripts/qa/restart-loop.sh [ITERATIONS]
 
-Repeatedly SIGTERMs a running `cf-rs serve` process and relaunches it with
+Repeatedly SIGTERMs a running `open-functions serve` process and relaunches it with
 the same --data-dir, asserting that across every restart:
   - the number of registered functions is unchanged
   - the deployed function's current_revision is unchanged (no rebuild)
   - the SHA256 of the function's build artifact on disk is unchanged
-  - the cf_rs_builds_total Prometheus counter (summed across all label
+  - the open_functions_builds_total Prometheus counter (summed across all label
     combinations) is unchanged
 
 ITERATIONS defaults to 20 restarts, for a fast local sanity check. spec.md's
@@ -44,10 +44,10 @@ SC-006 calls for a 100-iteration stress run; run that explicitly with:
     scripts/qa/restart-loop.sh 100
 
 Environment variables:
-  CF_RS_BIN         Path to the cf-rs binary. Defaults to
-                     $CARGO_TARGET_DIR/release/cf-rs if CARGO_TARGET_DIR is
-                     set, else <repo_root>/target/release/cf-rs. Built via
-                     `cargo build --release -p cf-rs` first if missing.
+  OPEN_FUNCTIONS_BIN         Path to the open-functions binary. Defaults to
+                     $CARGO_TARGET_DIR/release/open-functions if CARGO_TARGET_DIR is
+                     set, else <repo_root>/target/release/open-functions. Built via
+                     `cargo build --release -p open-functions` first if missing.
   ADMIN_PORT         Admin API port to bind (default 18081).
   INVOKE_PORT         Invoke listener port to bind (default 18080).
   DEPLOY_TIMEOUT_SECS  Seconds to wait for the initial deploy to reach
@@ -89,21 +89,21 @@ fail() {
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 
-if [[ -n "${CF_RS_BIN:-}" ]]; then
+if [[ -n "${OPEN_FUNCTIONS_BIN:-}" ]]; then
   : # explicit override wins
 elif [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-  CF_RS_BIN="${CARGO_TARGET_DIR}/release/cf-rs"
+  OPEN_FUNCTIONS_BIN="${CARGO_TARGET_DIR}/release/open-functions"
 else
-  CF_RS_BIN="$REPO_ROOT/target/release/cf-rs"
+  OPEN_FUNCTIONS_BIN="$REPO_ROOT/target/release/open-functions"
 fi
 
-if [[ ! -x "$CF_RS_BIN" ]]; then
-  log "cf-rs binary not found at $CF_RS_BIN, building it first (cargo build --release -p cf-rs)..."
-  (cd "$REPO_ROOT" && cargo build --release -p cf-rs) \
-    || fail "cargo build --release -p cf-rs failed"
-  [[ -x "$CF_RS_BIN" ]] || fail "cf-rs binary still missing at $CF_RS_BIN after building"
+if [[ ! -x "$OPEN_FUNCTIONS_BIN" ]]; then
+  log "open-functions binary not found at $OPEN_FUNCTIONS_BIN, building it first (cargo build --release -p open-functions)..."
+  (cd "$REPO_ROOT" && cargo build --release -p open-functions) \
+    || fail "cargo build --release -p open-functions failed"
+  [[ -x "$OPEN_FUNCTIONS_BIN" ]] || fail "open-functions binary still missing at $OPEN_FUNCTIONS_BIN after building"
 fi
-log "Using cf-rs binary: $CF_RS_BIN"
+log "Using open-functions binary: $OPEN_FUNCTIONS_BIN"
 
 HELLO_HTTP_DIR="$REPO_ROOT/examples/hello-http"
 [[ -d "$HELLO_HTTP_DIR" ]] || fail "examples/hello-http not found at $HELLO_HTTP_DIR"
@@ -135,14 +135,14 @@ if port_in_use "$INVOKE_PORT"; then
   fail "INVOKE_PORT ${INVOKE_PORT} is already in use on 127.0.0.1; set INVOKE_PORT to a free port"
 fi
 
-DATA_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cf-rs-restart-loop.XXXXXX")
+DATA_DIR=$(mktemp -d "${TMPDIR:-/tmp}/open-functions-restart-loop.XXXXXX")
 SERVE_PID=""
 
 cleanup() {
   local ec=$?
   set +e
   if [[ -n "$SERVE_PID" ]] && kill -0 "$SERVE_PID" 2>/dev/null; then
-    log "cleanup: stopping leftover cf-rs serve (pid $SERVE_PID)"
+    log "cleanup: stopping leftover open-functions serve (pid $SERVE_PID)"
     kill "$SERVE_PID" 2>/dev/null
     wait "$SERVE_PID" 2>/dev/null
   fi
@@ -225,7 +225,7 @@ expect_status() {
 }
 
 start_serve() {
-  "$CF_RS_BIN" serve \
+  "$OPEN_FUNCTIONS_BIN" serve \
     --data-dir "$DATA_DIR" \
     --invoke-listen "127.0.0.1:${INVOKE_PORT}" \
     --admin-listen "127.0.0.1:${ADMIN_PORT}" \
@@ -285,7 +285,7 @@ get_artifact_hash() {
 }
 
 get_builds_total() {
-  # cf_rs_builds_total is a labeled counter (function, mode, result per
+  # open_functions_builds_total is a labeled counter (function, mode, result per
   # ops-config.md); sum every label combination's value for one comparable
   # total. Prometheus text exposition format lines are "name{labels} value"
   # (two whitespace-separated fields), so summing field 2 across every
@@ -294,14 +294,14 @@ get_builds_total() {
   # and 0 == 0 across restarts is still a valid "no rebuild" invariant.
   http_call GET "$ADMIN_URL/metrics"
   expect_status "$HTTP_STATUS" 200 "GET /metrics" "$HTTP_BODY"
-  printf '%s' "$HTTP_BODY" | awk '/^cf_rs_builds_total/ {sum += $2} END {print sum + 0}'
+  printf '%s' "$HTTP_BODY" | awk '/^open_functions_builds_total/ {sum += $2} END {print sum + 0}'
 }
 
-log "Starting cf-rs serve: data-dir=$DATA_DIR invoke=$INVOKE_URL admin=$ADMIN_URL"
+log "Starting open-functions serve: data-dir=$DATA_DIR invoke=$INVOKE_URL admin=$ADMIN_URL"
 start_serve
 wait_for_ready "$READY_TIMEOUT_SECS" \
-  || fail "cf-rs serve (pid $SERVE_PID) did not become ready within ${READY_TIMEOUT_SECS}s on initial start. Log: $DATA_DIR/serve.log"
-log "cf-rs serve is ready (pid $SERVE_PID)"
+  || fail "open-functions serve (pid $SERVE_PID) did not become ready within ${READY_TIMEOUT_SECS}s on initial start. Log: $DATA_DIR/serve.log"
+log "open-functions serve is ready (pid $SERVE_PID)"
 
 log "Deploying $FN_NAME from $HELLO_HTTP_DIR (source-mode; this triggers a real cold build and may take a few minutes)"
 DEPLOY_BODY=$(jq -n --arg path "$HELLO_HTTP_DIR" \
@@ -317,7 +317,7 @@ BASELINE_REVISION=$(get_current_revision)
 BASELINE_HASH=$(get_artifact_hash "$BASELINE_REVISION")
 BASELINE_BUILDS=$(get_builds_total)
 
-log "Baseline captured: functions=$BASELINE_COUNT current_revision=$BASELINE_REVISION artifact_sha256=$BASELINE_HASH cf_rs_builds_total=$BASELINE_BUILDS"
+log "Baseline captured: functions=$BASELINE_COUNT current_revision=$BASELINE_REVISION artifact_sha256=$BASELINE_HASH open_functions_builds_total=$BASELINE_BUILDS"
 log "Running $ITERATIONS restart iterations..."
 
 for ((i = 1; i <= ITERATIONS; i++)); do
@@ -325,12 +325,12 @@ for ((i = 1; i <= ITERATIONS; i++)); do
   kill -TERM "$SERVE_PID" || fail "iteration $i: failed to send SIGTERM to pid $SERVE_PID"
 
   wait_for_exit "$SERVE_PID" "$SHUTDOWN_TIMEOUT_SECS" \
-    || fail "iteration $i: cf-rs serve (pid $SERVE_PID) did not exit within ${SHUTDOWN_TIMEOUT_SECS}s after SIGTERM"
+    || fail "iteration $i: open-functions serve (pid $SERVE_PID) did not exit within ${SHUTDOWN_TIMEOUT_SECS}s after SIGTERM"
 
   log "Iteration $i/$ITERATIONS: process exited cleanly, relaunching with the same --data-dir"
   start_serve
   wait_for_ready "$READY_TIMEOUT_SECS" \
-    || fail "iteration $i: cf-rs serve (pid $SERVE_PID) did not become ready within ${READY_TIMEOUT_SECS}s after restart. Log: $DATA_DIR/serve.log"
+    || fail "iteration $i: open-functions serve (pid $SERVE_PID) did not become ready within ${READY_TIMEOUT_SECS}s after restart. Log: $DATA_DIR/serve.log"
 
   count=$(get_function_count)
   if [[ "$count" != "$BASELINE_COUNT" ]]; then
@@ -349,11 +349,11 @@ for ((i = 1; i <= ITERATIONS; i++)); do
 
   builds=$(get_builds_total)
   if [[ "$builds" != "$BASELINE_BUILDS" ]]; then
-    fail "iteration $i: cf_rs_builds_total changed -- baseline=$BASELINE_BUILDS now=$builds (a rebuild was triggered by the restart)"
+    fail "iteration $i: open_functions_builds_total changed -- baseline=$BASELINE_BUILDS now=$builds (a rebuild was triggered by the restart)"
   fi
 
-  log "Iteration $i/$ITERATIONS: OK (functions=$count current_revision=$revision artifact_sha256=$hash cf_rs_builds_total=$builds)"
+  log "Iteration $i/$ITERATIONS: OK (functions=$count current_revision=$revision artifact_sha256=$hash open_functions_builds_total=$builds)"
 done
 
-log "SUCCESS: $ITERATIONS restart(s) completed. All invariants held: function count, current_revision, build artifact sha256, and cf_rs_builds_total never changed."
+log "SUCCESS: $ITERATIONS restart(s) completed. All invariants held: function count, current_revision, build artifact sha256, and open_functions_builds_total never changed."
 exit 0

@@ -1,17 +1,17 @@
-//! Minimal HTTP function using `cf-rs-sdk`. Runs unmodified on cf-rs
-//! (`cf-rs fn deploy hello --source examples/hello-http --entry-point hello`)
+//! Minimal HTTP function using `open-functions-sdk`. Runs unmodified on open-functions
+//! (`open-functions fn deploy hello --source examples/hello-http --entry-point hello`)
 //! and on Google Cloud Run functions (deploy this directory as a container).
 //!
-//! Test-only behavior, controlled by env vars (used by cf-rs's own test
+//! Test-only behavior, controlled by env vars (used by open-functions's own test
 //! suite, harmless in normal use):
 //! - `FAIL=1`: returns 500 instead of handling the request.
 //! - `CRASH=1`: exits the process immediately (simulates an instance crash).
 //! - `SLEEP_MS=<n>`: sleeps for `n` milliseconds before responding.
 
-use cf_rs_sdk::{Functions, HttpRequest, HttpResponse};
+use open_functions_sdk::{Functions, HttpRequest, HttpResponse};
 
 #[tokio::main]
-async fn main() -> Result<(), cf_rs_sdk::Error> {
+async fn main() -> Result<(), open_functions_sdk::Error> {
     Functions::new().http("hello", hello).serve().await
 }
 

@@ -1,0 +1,35 @@
+---
+galaxy_info:
+  role_name: open_functions
+  author: open-functions project
+  description: >-
+    Deploys open-functions (a Cloud Run Functions-compatible local runtime) to a
+    host as either a systemd service or a Docker container.
+  license: MIT OR Apache-2.0
+  min_ansible_version: "2.15"
+
+  platforms:
+    - name: Debian
+      versions:
+        - bullseye
+        - bookworm
+    - name: Ubuntu
+      versions:
+        - jammy
+        - noble
+    - name: EL
+      versions:
+        - "9"
+
+  galaxy_tags:
+    - cloud
+    - faas
+    - serverless
+    - docker
+    - systemd
+
+# No hard role dependency on ps_rs: the two roles co-exist on the same
+# host (see ansible-vars.md, "co-location with ps-rs") but are applied
+# independently, in order, from the top-level playbook - not chained
+# through meta dependencies.
+dependencies: []

@@ -1,0 +1,69 @@
+# Managed by Ansible - local changes will be overwritten.
+# Source: ansible/roles/open_functions/templates/config.toml.j2
+#
+# Schema: specs/001-cloud-functions-local/contracts/ops-config.md
+# ("configuration schema" section) / crates/open-functions/src/config.rs.
+# Every section below is deny_unknown_fields on the open-functions side, so any key
+# supplied through open_functions_extra_config must match a field open-functions actually
+# knows about - `open-functions check-config` (run via this template's `validate:`
+# hook) is what catches a typo here.
+{% macro toml_value(v) -%}
+{%- if v is sameas true -%}
+true
+{%- elif v is sameas false -%}
+false
+{%- elif v is number -%}
+{{ v }}
+{%- else -%}
+{{ v | to_json }}
+{%- endif -%}
+{%- endmacro %}
+{% macro toml_section(name, base) %}
+[{{ name }}]
+{% set merged = base | combine(open_functions_extra_config[name] | default({})) %}
+{% for key, value in merged.items() %}
+{{ key }} = {{ toml_value(value) }}
+{% endfor %}
+{% endmacro %}
+{{ toml_section('invoke', {
+  'listen': open_functions_config_invoke_listen,
+  'public_base_url': '',
+  'host_suffix': open_functions_host_suffix,
+  'shutdown_grace_secs': open_functions_shutdown_grace_secs,
+}) }}
+{{ toml_section('admin', {
+  'listen': open_functions_config_admin_listen,
+  'token': open_functions_admin_token,
+  'token_file': '',
+  'metrics_require_token': false,
+}) }}
+{{ toml_section('storage', {
+  'data_dir': open_functions_config_storage_data_dir,
+}) }}
+{{ toml_section('build', {
+  'mode': open_functions_build_mode,
+}) }}
+{{ toml_section('runtime', {
+  'cgroup': open_functions_runtime_cgroup,
+  'docker_network': open_functions_docker_network,
+}) }}
+{{ toml_section('defaults', {}) }}
+{{ toml_section('pubsub', {
+  'enabled': true,
+  'base_url': open_functions_pubsub_base_url,
+  'project': open_functions_pubsub_project,
+  'push_base_url': open_functions_pubsub_push_base_url,
+}) }}
+{{ toml_section('log', {
+  'format': open_functions_log_format,
+  'level': open_functions_log_level,
+}) }}
+{{ toml_section('metrics', {
+  'enabled': true,
+}) }}
+{% set known_sections = ['invoke', 'admin', 'storage', 'build', 'runtime', 'defaults', 'pubsub', 'log', 'metrics'] %}
+{% for name, section in open_functions_extra_config.items() %}
+{% if name not in known_sections %}
+{{ toml_section(name, {}) }}
+{% endif %}
+{% endfor %}

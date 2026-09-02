@@ -1,0 +1,155 @@
+---
+# Molecule scenario (docker driver) for the open_functions role - spec-kit task
+# T059: converge -> idempotence (changed=0) -> verify (/readyz 200,
+# `open-functions version` matches, Delegate=yes) for both open_functions_deploy_mode
+# values.
+#
+# Two Molecule *instances*, not one instance converged twice: converge.yml
+# applies the role exactly once per platform/instance, and this scenario
+# needs both open_functions_deploy_mode=systemd and open_functions_deploy_mode=docker
+# exercised by a single `molecule test` run - the CI job invokes plain
+# `molecule test` with no scenario-selection flags (.github/workflows/
+# ci.yml's "molecule" job just does `cd ansible/roles/open_functions && molecule
+# test`), so the mode split has to live in platforms:/inventory here, not
+# in extra CLI flags.
+#
+# --- systemd-mode instance (open-functions-systemd) -----------------------------
+#
+# Running a real systemd unit inside a Docker container needs a
+# systemd-as-PID-1 image plus container settings that let systemd manage
+# its own cgroups. geerlingguy's docker-<distro>-ansible images are the
+# de-facto standard for this in the Ansible community (used across many
+# public role repos, e.g. geerlingguy.docker, geerlingguy.mysql, and
+# geerlingguy's own "Running Systemd in a Docker Container for Ansible
+# Molecule Testing" writeup): they ship systemd as the image's default CMD
+# plus Ansible's own Python dependencies preinstalled, so nothing extra
+# needs to be bootstrapped beyond the container settings below. Each
+# setting's reasoning, verified against this repo's own target platforms
+# (meta/main.yml: Debian 11+/Ubuntu 22.04+/EL9, all cgroup-v2-only by
+# default) and confirmed by actually running this scenario:
+#   - privileged: true            - systemd needs to manage cgroups, mount
+#                                    points, and (docker-mode instance
+#                                    only) start its own nested Docker
+#                                    daemon; none of that works
+#                                    unprivileged.
+#   - cgroupns_mode: host         - shares the host's cgroup namespace so
+#                                    the container's systemd sees a real
+#                                    cgroup tree it can manage, rather than
+#                                    an empty private one.
+#   - volumes: .../cgroup:...:rw  - bind-mounts the host's cgroup v2 tree
+#                                    in read-write. A read-only mount left
+#                                    systemd unable to create its own
+#                                    scope/slice cgroups under
+#                                    /sys/fs/cgroup, which breaks cgroup
+#                                    delegation entirely - i.e. exactly the
+#                                    Delegate=yes behavior this scenario's
+#                                    verify.yml asserts open-functions.service has.
+#   - command: ""                 - lets the image's own default CMD
+#                                    (/lib/systemd/systemd) run instead of
+#                                    Molecule's usual long-running
+#                                    placeholder command; systemd must be
+#                                    PID 1 for any of this to work.
+#   - pre_build_image: true       - the image already has everything
+#                                    Ansible needs (Python3, apt), so
+#                                    Molecule can use it directly instead
+#                                    of layering its own throwaway
+#                                    Dockerfile on top of it.
+#
+# --- docker-mode instance (open-functions-docker) --------------------------------
+#
+# open_functions_deploy_mode=docker makes the role itself launch a *second-level*
+# container (community.docker.docker_container/docker_network) from
+# inside this Molecule instance, and the role's tasks/verify.yml polls
+# http://127.0.0.1:{{ open_functions_admin_port }}/readyz *from inside this
+# instance's own network namespace* (see vars/main.yml's
+# open_functions_config_invoke_listen comment - docker's host-port-publish DNAT
+# only reaches a container's own loopback, not a sibling's). That rules
+# out Docker-outside-of-Docker (bind-mounting this instance onto the
+# *outer* Docker socket): the open-functions container would come up as a sibling
+# of this instance on the outer daemon and publish its ports on the outer
+# host's loopback, which this instance's own 127.0.0.1 cannot see. So this
+# instance needs a genuine nested Docker daemon running inside its own
+# netns (real Docker-in-Docker) - reusing the same systemd-capable
+# geerlingguy image (rather than a separate dind-flavoured one) and
+# installing/starting the Docker engine via converge.yml's pre_tasks keeps
+# both instances on one well-understood recipe, and the privileged/cgroup
+# settings above are exactly what the nested dockerd also needs to run
+# its own containers.
+#
+# Both instances bind-mount /tmp/open-functions-molecule-release read-only at
+# /opt/open-functions-release: this scenario's prepare.yml builds a real open-functions
+# release binary + SHA256SUMS (systemd mode) and a real open-functions Docker image
+# tar (docker mode) from this repo's own source into that host directory,
+# since there is no tagged GitHub Release/GHCR image to fetch from yet -
+# see prepare.yml for the full reasoning.
+# Molecule's prerun step tries to compute a Galaxy-style fully-qualified
+# role name (<namespace>.<name>) from meta/main.yml's galaxy_info, purely
+# to symlink this role into a scratch collection so bare `roles: -
+# role: open_functions`-style references resolve. This role's meta/main.yml sets
+# `author: open-functions project` (not a Galaxy namespace - and not something this
+# scenario may change, since it is unrelated to the role's actual Ansible
+# behavior), which fails that FQRN pattern; role_name_check: 2 skips the
+# check entirely, which is safe here since converge.yml never uses that
+# bare-name path anyway (it references the role by explicit relative
+# path - see converge.yml's own comment on that).
+role_name_check: 2
+
+dependency:
+  name: galaxy
+  # Relative to the CWD `molecule` is invoked from - the role's own root
+  # directory (ansible/roles/open_functions), per this repo's convention (see
+  # .github/workflows/ci.yml's molecule job: `working-directory:
+  # ansible/roles/open_functions`), not relative to this scenario directory.
+  # ansible/roles/open_functions -> ansible/requirements.yml is two directories up.
+  options:
+    requirements-file: ../../requirements.yml
+    role-file: ../../requirements.yml
+
+driver:
+  name: docker
+
+platforms:
+  - name: open-functions-systemd
+    image: "geerlingguy/docker-debian12-ansible:latest"
+    pre_build_image: true
+    privileged: true
+    cgroupns_mode: host
+    command: ""
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - /tmp/open-functions-molecule-release:/opt/open-functions-release:ro
+
+  - name: open-functions-docker
+    image: "geerlingguy/docker-debian12-ansible:latest"
+    pre_build_image: true
+    privileged: true
+    cgroupns_mode: host
+    command: ""
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - /tmp/open-functions-molecule-release:/opt/open-functions-release:ro
+
+provisioner:
+  name: ansible
+  inventory:
+    host_vars:
+      open-functions-systemd:
+        open_functions_deploy_mode: systemd
+        open_functions_version: "0.1.0"
+        open_functions_release_base_url: "file:///opt/open-functions-release"
+      open-functions-docker:
+        open_functions_deploy_mode: docker
+        open_functions_version: "0.1.0"
+        open_functions_image: open-functions-molecule
+        open_functions_image_tag: "0.1.0"
+        # docker mode's internal admin.listen is always 0.0.0.0 (see
+        # vars/main.yml's open_functions_config_admin_listen), which open-functions's own
+        # config schema treats as non-loopback regardless of
+        # open_functions_admin_bind_address - tasks/preflight.yml requires a token
+        # whenever open_functions_deploy_mode is docker for exactly that reason.
+        # Not a secret worth Vault-encrypting here - it only guards a
+        # throwaway Molecule test container's admin API.
+        open_functions_admin_token: "molecule-test-admin-token"
+
+verifier:
+  name: ansible

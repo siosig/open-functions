@@ -1,5 +1,5 @@
 # Builds the same binary two ways can produce: `cargo build --release` on a
-# host with the Rust toolchain, or this image (used by cf-rs's container
+# host with the Rust toolchain, or this image (used by open-functions's container
 # build mode, and directly deployable to Cloud Run functions as a container).
 FROM rust:1-bookworm AS builder
 WORKDIR /src

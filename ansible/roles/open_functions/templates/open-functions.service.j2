@@ -1,0 +1,45 @@
+# Managed by Ansible - local changes will be overwritten.
+# Source: ansible/roles/open_functions/templates/open-functions.service.j2
+# See specs/001-cloud-functions-local/contracts/ops-config.md, section
+# "systemd integration", for the rationale behind each setting below.
+
+[Unit]
+Description=open-functions - Cloud Run Functions-compatible local runtime
+Documentation=https://github.com/siosig/open-functions
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart={{ open_functions_binary_path }} serve --config {{ open_functions_config_path }}
+Restart=on-failure
+TimeoutStopSec={{ open_functions_shutdown_grace_secs + 10 }}
+Delegate=yes
+User={{ open_functions_system_user }}
+Group={{ open_functions_system_group }}
+{% if open_functions_enable_docker %}
+SupplementaryGroups=docker
+{% endif %}
+StateDirectory={{ open_functions_service_name }}
+# Without an explicit mode, systemd defaults StateDirectoryMode to 0755 and
+# re-applies it to the state directory every time this unit starts,
+# clobbering the 0750 the role's "Create the open-functions data directory" task
+# sets — the two would otherwise fight on every restart, breaking Ansible
+# idempotence (Molecule's idempotence check caught exactly this).
+StateDirectoryMode=0750
+ReadWritePaths={{ open_functions_data_dir }}
+NoNewPrivileges=yes
+ProtectSystem=strict
+{% if open_functions_source_dirs | length > 0 %}
+ProtectHome=yes
+{% for src in open_functions_source_dirs %}
+BindReadOnlyPaths={{ src }}
+{% endfor %}
+{% else %}
+ProtectHome=read-only
+{% endif %}
+PrivateTmp=yes
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

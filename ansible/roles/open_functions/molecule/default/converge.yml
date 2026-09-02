@@ -1,0 +1,80 @@
+---
+- name: Converge
+  hosts: all
+  become: true
+  pre_tasks:
+    # Bootstrap a *nested* Docker Engine inside the open-functions-docker instance
+    # only - see molecule.yml's docker-mode reasoning for why this has to
+    # be a real Docker-in-Docker daemon (not a bind-mounted socket to the
+    # outer daemon). These pre_tasks run on every converge, including the
+    # `idempotence` step's re-run, so each one has to be genuinely
+    # idempotent (changed=0 on a second run) in its own right, not just
+    # "safe to repeat".
+    - name: Install the Docker engine and Python SDK inside the docker-mode instance
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - python3-docker
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      when: open_functions_deploy_mode == 'docker'
+
+    - name: Start and enable the nested Docker daemon (docker-mode instance)
+      ansible.builtin.systemd_service:
+        name: docker
+        state: started
+        enabled: true
+      when: open_functions_deploy_mode == 'docker'
+
+    - name: Wait for the nested Docker daemon's socket to come up
+      ansible.builtin.wait_for:
+        path: /var/run/docker.sock
+        timeout: 30
+      when: open_functions_deploy_mode == 'docker'
+
+    # prepare.yml built the real open-functions image on the *outer* Docker daemon
+    # and saved it to a tar under the bind-mounted /opt/open-functions-release; load
+    # it into this instance's own nested daemon so the role's later
+    # `docker run`/docker_container tasks (which talk to *this* instance's
+    # local daemon) find open_functions_image:open_functions_image_tag already present and
+    # never attempt to pull it from ghcr.io.
+    - name: Check whether the open-functions test image is already loaded into the nested daemon
+      community.docker.docker_image_info:
+        name: "{{ open_functions_image }}:{{ open_functions_image_tag }}"
+      register: open_functions_molecule_nested_image_info
+      when: open_functions_deploy_mode == 'docker'
+
+    - name: Load the locally-built open-functions image into the nested Docker daemon
+      ansible.builtin.command:
+        cmd: docker load -i /opt/open-functions-release/open-functions-molecule-image.tar
+      changed_when: true
+      when:
+        - open_functions_deploy_mode == 'docker'
+        - open_functions_molecule_nested_image_info.images | length == 0
+  roles:
+    # An explicit path (rather than a bare role name) makes Ansible
+    # resolve this directly against the filesystem instead of searching
+    # roles_path/ANSIBLE_ROLES_PATH - which keeps this scenario
+    # self-contained: it works under plain `ansible-lint ansible/` (the
+    # CI "ansible-lint" job's invocation, run from the repo root, which
+    # has no roles_path pointed at ansible/roles) as well as under
+    # `molecule test`, with no environment/config assumptions either way.
+    #
+    # It has to be `{{ playbook_dir }}/../..` rather than a bare relative
+    # `../..`: role-path resolution for a *relative* `roles: - role: ...`
+    # entry is anchored to ansible-playbook's own process CWD (confirmed
+    # with `ansible-playbook --list-tasks` - a bare `../..`, or even `.`,
+    # silently contributed zero tasks when invoked from this repo's
+    # documented CWD for Molecule, ansible/roles/open_functions, since that CWD is
+    # already two directories below this scenario's own directory).
+    # `playbook_dir` is always this playbook's own directory
+    # (.../open_functions/molecule/default) regardless of invocation CWD, so
+    # `{{ playbook_dir }}/../..` reaches ansible/roles/open_functions itself
+    # (this role's root) consistently either way.
+    #
+    # ansible-lint's role-name[path] rule normally steers people away from
+    # path-based role references (it assumes a Galaxy-style bare name is
+    # always resolvable), which does not hold for a role under test by its
+    # own nested Molecule scenario - suppressed for that reason.
+    - role: "{{ playbook_dir }}/../.." # noqa: role-name[path]

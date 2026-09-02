@@ -13,7 +13,7 @@ permissions:
   packages: write
 
 jobs:
-  # Cross-compile the cf-rs binary for each release target with
+  # Cross-compile the open-functions binary for each release target with
   # cargo-zigbuild against the musl targets, producing statically linked
   # binaries with no glibc dependency (same approach as the repo-root
   # Dockerfile's builder stage). Each target's binary is packaged into a
@@ -45,7 +45,7 @@ jobs:
           tool: cargo-zigbuild
 
       - name: Build release binary
-        run: cargo zigbuild --release --target ${{ matrix.target }} -p cf-rs
+        run: cargo zigbuild --release --target ${{ matrix.target }} -p open-functions
 
       - name: Package release archive
         id: package
@@ -54,16 +54,16 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          stage="$(mktemp -d)/cf-rs-${VERSION}-${TARGET}"
+          stage="$(mktemp -d)/open-functions-${VERSION}-${TARGET}"
           mkdir -p "$stage"
-          cp "target/${TARGET}/release/cf-rs" "$stage/cf-rs"
-          asset="cf-rs-${VERSION}-${TARGET}.tar.gz"
+          cp "target/${TARGET}/release/open-functions" "$stage/open-functions"
+          asset="open-functions-${VERSION}-${TARGET}.tar.gz"
           tar -czf "$asset" -C "$(dirname "$stage")" "$(basename "$stage")"
           echo "asset=${asset}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: cf-rs-${{ matrix.target }}
+          name: open-functions-${{ matrix.target }}
           path: ${{ steps.package.outputs.asset }}
           if-no-files-found: error
 

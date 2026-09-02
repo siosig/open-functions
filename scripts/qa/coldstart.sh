@@ -6,7 +6,7 @@
 # function has been scaled to zero, the very next invocation must get its
 # first response byte back in under 1 second.
 #
-# This script starts a real `cf-rs serve` process against a throwaway
+# This script starts a real `open-functions serve` process against a throwaway
 # --data-dir, deploys examples/hello-http as a real (source-mode) function,
 # warms it up with one request (proving it works, and giving `fn stop`
 # something real to scale down from), stops it via `POST .../stop` (forcing
@@ -26,10 +26,10 @@ throwaway function, scales it to zero, then measures the time-to-first-byte
 Fails if TTFB is not under 1 second.
 
 Environment variables:
-  CF_RS_BIN             Path to the cf-rs binary. Defaults to
-                        $CARGO_TARGET_DIR/release/cf-rs if CARGO_TARGET_DIR
-                        is set, else <repo_root>/target/release/cf-rs. Built
-                        via `cargo build --release -p cf-rs` first if
+  OPEN_FUNCTIONS_BIN             Path to the open-functions binary. Defaults to
+                        $CARGO_TARGET_DIR/release/open-functions if CARGO_TARGET_DIR
+                        is set, else <repo_root>/target/release/open-functions. Built
+                        via `cargo build --release -p open-functions` first if
                         missing.
   ADMIN_PORT            Admin API port to bind (default 19181).
   INVOKE_PORT           Invoke listener port to bind (default 19180).
@@ -79,21 +79,21 @@ fail() {
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 
-if [[ -n "${CF_RS_BIN:-}" ]]; then
+if [[ -n "${OPEN_FUNCTIONS_BIN:-}" ]]; then
   : # explicit override wins
 elif [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-  CF_RS_BIN="${CARGO_TARGET_DIR}/release/cf-rs"
+  OPEN_FUNCTIONS_BIN="${CARGO_TARGET_DIR}/release/open-functions"
 else
-  CF_RS_BIN="$REPO_ROOT/target/release/cf-rs"
+  OPEN_FUNCTIONS_BIN="$REPO_ROOT/target/release/open-functions"
 fi
 
-if [[ ! -x "$CF_RS_BIN" ]]; then
-  log "cf-rs binary not found at $CF_RS_BIN, building it first (cargo build --release -p cf-rs)..."
-  (cd "$REPO_ROOT" && cargo build --release -p cf-rs) \
-    || fail "cargo build --release -p cf-rs failed"
-  [[ -x "$CF_RS_BIN" ]] || fail "cf-rs binary still missing at $CF_RS_BIN after building"
+if [[ ! -x "$OPEN_FUNCTIONS_BIN" ]]; then
+  log "open-functions binary not found at $OPEN_FUNCTIONS_BIN, building it first (cargo build --release -p open-functions)..."
+  (cd "$REPO_ROOT" && cargo build --release -p open-functions) \
+    || fail "cargo build --release -p open-functions failed"
+  [[ -x "$OPEN_FUNCTIONS_BIN" ]] || fail "open-functions binary still missing at $OPEN_FUNCTIONS_BIN after building"
 fi
-log "Using cf-rs binary: $CF_RS_BIN"
+log "Using open-functions binary: $OPEN_FUNCTIONS_BIN"
 
 HELLO_HTTP_DIR="$REPO_ROOT/examples/hello-http"
 [[ -d "$HELLO_HTTP_DIR" ]] || fail "examples/hello-http not found at $HELLO_HTTP_DIR"
@@ -126,14 +126,14 @@ if port_in_use "$INVOKE_PORT"; then
   fail "INVOKE_PORT ${INVOKE_PORT} is already in use on 127.0.0.1; set INVOKE_PORT to a free port"
 fi
 
-DATA_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cf-rs-coldstart.XXXXXX")
+DATA_DIR=$(mktemp -d "${TMPDIR:-/tmp}/open-functions-coldstart.XXXXXX")
 SERVE_PID=""
 
 cleanup() {
   local ec=$?
   set +e
   if [[ -n "$SERVE_PID" ]] && kill -0 "$SERVE_PID" 2>/dev/null; then
-    log "cleanup: stopping cf-rs serve (pid $SERVE_PID)"
+    log "cleanup: stopping open-functions serve (pid $SERVE_PID)"
     kill "$SERVE_PID" 2>/dev/null
     wait "$SERVE_PID" 2>/dev/null
   fi
@@ -193,7 +193,7 @@ expect_status() {
 }
 
 start_serve() {
-  "$CF_RS_BIN" serve \
+  "$OPEN_FUNCTIONS_BIN" serve \
     --data-dir "$DATA_DIR" \
     --invoke-listen "127.0.0.1:${INVOKE_PORT}" \
     --admin-listen "127.0.0.1:${ADMIN_PORT}" \
@@ -243,11 +243,11 @@ wait_for_instances_running() {
   done
 }
 
-log "Starting cf-rs serve: data-dir=$DATA_DIR invoke=$INVOKE_URL admin=$ADMIN_URL"
+log "Starting open-functions serve: data-dir=$DATA_DIR invoke=$INVOKE_URL admin=$ADMIN_URL"
 start_serve
 wait_for_ready "$READY_TIMEOUT_SECS" \
-  || fail "cf-rs serve (pid $SERVE_PID) did not become ready within ${READY_TIMEOUT_SECS}s. Log: $DATA_DIR/serve.log"
-log "cf-rs serve is ready (pid $SERVE_PID)"
+  || fail "open-functions serve (pid $SERVE_PID) did not become ready within ${READY_TIMEOUT_SECS}s. Log: $DATA_DIR/serve.log"
+log "open-functions serve is ready (pid $SERVE_PID)"
 
 log "Deploying $FN_NAME from $HELLO_HTTP_DIR (source-mode; this triggers a real cold build and may take a few minutes)"
 DEPLOY_BODY=$(jq -n --arg path "$HELLO_HTTP_DIR" \
