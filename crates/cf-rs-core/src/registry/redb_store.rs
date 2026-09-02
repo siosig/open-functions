@@ -196,6 +196,19 @@ impl Store for RedbStore {
         }
     }
 
+    fn list_builds(&self) -> Result<Vec<Build>, StoreError> {
+        let read_txn = self.db.begin_read().map_err(backend_err)?;
+        let table = read_txn.open_table(BUILDS_TABLE).map_err(backend_err)?;
+
+        let mut builds = Vec::new();
+        for entry in table.iter().map_err(backend_err)? {
+            let (_key, value) = entry.map_err(backend_err)?;
+            builds.push(from_json::<Build>(value.value())?);
+        }
+
+        Ok(builds)
+    }
+
     fn get_binding(&self, name: &str) -> Result<Option<TriggerBinding>, StoreError> {
         let read_txn = self.db.begin_read().map_err(backend_err)?;
         let table = read_txn.open_table(BINDINGS_TABLE).map_err(backend_err)?;

@@ -208,6 +208,34 @@ impl InstancePool {
         self.inner.lock().await.draining
     }
 
+    /// Stops every currently-tracked instance (SIGTERM, up to `grace`, then
+    /// SIGKILL — see `InstanceHandle::stop`), for process shutdown (T061).
+    /// Does not set `draining`: the caller (process shutdown) has already
+    /// stopped accepting new connections at the listener level, so refusing
+    /// new `acquire()` calls here isn't needed and would only matter for a
+    /// pool this call doesn't otherwise affect. Runs every instance's stop
+    /// concurrently and waits for all of them, so the process doesn't exit
+    /// mid-teardown.
+    pub async fn stop_all(&self, grace: Duration) {
+        let handles: Vec<InstanceHandle> = {
+            let mut state = self.inner.lock().await;
+            state
+                .instances
+                .drain()
+                .filter_map(|(_, mut inst)| inst.handle.take())
+                .collect()
+        };
+        let mut tasks = Vec::with_capacity(handles.len());
+        for handle in handles {
+            tasks.push(tokio::spawn(async move {
+                let _ = handle.stop(grace).await;
+            }));
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+
     /// Number of instances currently tracked (ready and running). Exposed as
     /// a plain `pub` method rather than `#[cfg(test)]` since it is also
     /// useful for an admin/metrics endpoint later.
@@ -256,6 +284,33 @@ impl InstancePool {
                         continue;
                     }
                 },
+            }
+        }
+    }
+
+    /// Starts new instances (via the same single-flight `begin_start`/
+    /// `finish_start` primitives `acquire()` uses) until `instance_count()`
+    /// reaches `target`, without claiming any concurrency slot on them — so
+    /// they sit fully idle, ready to serve the first real request instantly.
+    /// Used at startup restore (T060) to pre-warm `min_instances`, per
+    /// FR-016. Stops early (returning the first error) if a spawn fails,
+    /// rather than retrying forever against a persistently broken artifact;
+    /// the caller decides whether that's fatal (restore treats it as a
+    /// warning, not a startup failure).
+    pub async fn warm_to(&self, target: u32) -> Result<(), DriverError> {
+        loop {
+            if self.instance_count().await as u32 >= target {
+                return Ok(());
+            }
+            match self.begin_start().await {
+                BeginStart::Proceed { permit, spec } => {
+                    self.finish_start(permit, spec).await?;
+                }
+                BeginStart::WaitForOther(notify) => {
+                    let _ =
+                        tokio::time::timeout(self.config.start_timeout, notify.notified()).await;
+                }
+                BeginStart::AtCapacity | BeginStart::Draining => return Ok(()),
             }
         }
     }

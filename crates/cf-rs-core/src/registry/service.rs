@@ -110,7 +110,10 @@ pub enum DeleteError {
 /// Ties `Store` + `Builder` + `Driver` + per-function `InstancePool`s
 /// together. One `RegistryService` per running `cf-rs` process.
 pub struct RegistryService {
-    store: Arc<dyn Store>,
+    // `pub(crate)` (rather than private) so `registry::restore` can query
+    // the store directly (`list_builds`/`list_functions`/`get_revision`,
+    // etc.) without a wrapper method per call.
+    pub(crate) store: Arc<dyn Store>,
     builder: Arc<dyn Builder>,
     driver: Arc<dyn Driver>,
     global_limit: Arc<Semaphore>,
@@ -193,6 +196,23 @@ impl RegistryService {
     /// 404/503 per `function-contract.md`'s status table.
     pub async fn pool_for(&self, name: &str) -> Option<Arc<InstancePool>> {
         self.pools.lock().await.get(name).cloned()
+    }
+
+    /// Stops every running instance across every function's pool (SIGTERM →
+    /// `grace` → SIGKILL), for graceful process shutdown (T061). Pools are
+    /// stopped concurrently with each other (independent functions), each
+    /// pool's own instances also concurrently (`InstancePool::stop_all`).
+    pub async fn shutdown_all_instances(&self, grace: Duration) {
+        let pools: Vec<Arc<InstancePool>> = self.pools.lock().await.values().cloned().collect();
+        let mut tasks = Vec::with_capacity(pools.len());
+        for pool in pools {
+            tasks.push(tokio::spawn(async move {
+                pool.stop_all(grace).await;
+            }));
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
     }
 
     /// Validates and accepts a registration, then builds and deploys it in
@@ -385,7 +405,10 @@ impl RegistryService {
     /// Builds (or replaces) the `InstancePool` for `name` from a freshly
     /// built `Revision`, atomically switches `current_revision` in the store,
     /// and starts the idle reaper if this is the pool's first activation.
-    async fn activate_revision(
+    /// `pub(crate)` (rather than private) so `registry::restore` can reuse
+    /// it to recreate pools from a persisted `Revision` at startup, without
+    /// duplicating the `InstanceSpec`/`PoolConfig` construction logic.
+    pub(crate) async fn activate_revision(
         &self,
         name: &str,
         revision: &Revision,

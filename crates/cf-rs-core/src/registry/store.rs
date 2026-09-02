@@ -21,6 +21,9 @@ pub trait Store: Send + Sync {
 
     fn put_build(&self, build: &Build) -> Result<(), StoreError>;
     fn get_build(&self, id: &str) -> Result<Option<Build>, StoreError>;
+    /// All tracked builds, in no particular order. Used by startup restore
+    /// (T060) to find builds left `running` by an unclean shutdown.
+    fn list_builds(&self) -> Result<Vec<Build>, StoreError>;
 
     fn get_binding(&self, name: &str) -> Result<Option<TriggerBinding>, StoreError>;
     fn put_binding(&self, binding: &TriggerBinding) -> Result<(), StoreError>;

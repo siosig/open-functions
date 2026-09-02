@@ -48,6 +48,7 @@ impl Forwarder {
         ctx: &RequestRewriteContext,
         timeout: Duration,
     ) -> Result<Response, ForwardFailure> {
+        let received_at = std::time::Instant::now();
         cf_rs_core::forward::rewrite_request_headers(req.headers_mut(), ctx);
 
         let path_and_query = req
@@ -70,7 +71,15 @@ impl Forwarder {
         };
         *req.uri_mut() = new_uri;
 
+        // `cf_rs_forward_overhead_seconds`: host-added latency only — the
+        // time spent here before the instance call starts, plus the time
+        // spent here after the instance's response arrives — deliberately
+        // excluding the instance's own processing time in between (that's
+        // what `cf_rs_invocation_duration_seconds` measures as a whole).
+        let pre_call_overhead = received_at.elapsed();
+
         let outcome = tokio::time::timeout(timeout, self.client.request(req)).await;
+        let response_received_at = std::time::Instant::now();
 
         let result = match outcome {
             Err(_) => Err(ForwardFailure::Timeout),
@@ -78,14 +87,20 @@ impl Forwarder {
             Ok(Ok(resp)) => Ok(resp),
         };
 
-        match result {
+        let final_result = match result {
             Ok(resp) => {
                 let (mut parts, body) = resp.into_parts();
                 rewrite_response_headers(&mut parts.headers, &ctx.execution_id);
                 Ok(Response::from_parts(parts, Body::new(body)))
             }
             Err(failure) => Err(failure),
-        }
+        };
+
+        let post_call_overhead = response_received_at.elapsed();
+        metrics::histogram!("cf_rs_forward_overhead_seconds")
+            .record((pre_call_overhead + post_call_overhead).as_secs_f64());
+
+        final_result
     }
 }
 

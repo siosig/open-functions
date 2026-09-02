@@ -1,7 +1,7 @@
-//! Top-level `serve` orchestration (T022, extended by T040/T041/T042):
+//! Top-level `serve` orchestration (T022, extended by T040/T041/T042/T060/T061):
 //! tracing/metrics → storage open → construct the `RegistryService` (build +
-//! runtime driver + instance pools) → bind both listeners → `READY=1` → run
-//! until a shutdown signal → graceful stop → exit.
+//! runtime driver + instance pools) → bind both listeners → startup restore
+//! → `READY=1` → run until a shutdown signal → graceful stop → exit.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -190,6 +190,27 @@ pub async fn run(cfg: AppConfig) -> ExitCode {
     let invoke_router =
         invoke::router(invoke_state).into_make_service_with_connect_info::<std::net::SocketAddr>();
 
+    // Startup restore (T060): both listeners are already bound above, and
+    // this must finish before `READY=1` per ops-config.md's systemd
+    // integration contract ("after both listeners bind + redb open +
+    // existing function metadata restore completes"). redb itself was
+    // already opened when `RegistryService` was constructed.
+    match registry.restore().await {
+        Ok(report) => {
+            tracing::info!(
+                functions_restored = report.functions_restored,
+                builds_marked_interrupted = report.builds_marked_interrupted,
+                broken_functions = ?report.broken_functions,
+                warm_start_failures = ?report.warm_start_failures,
+                "startup restore complete"
+            );
+        }
+        Err(err) => {
+            tracing::error!(%err, "startup restore failed");
+            return ExitCode::from(EXIT_RUNTIME_ERROR);
+        }
+    }
+
     let shutdown = ops::Shutdown::new();
     let mut invoke_shutdown_rx = shutdown.subscribe();
     let mut admin_shutdown_rx = shutdown.subscribe();
@@ -203,6 +224,13 @@ pub async fn run(cfg: AppConfig) -> ExitCode {
             let _ = admin_shutdown_rx.changed().await;
         });
 
+    // Spawned (not just constructed) so both listeners are actively serving
+    // from this point on, independent of whatever this function awaits next
+    // (the shutdown signal, below) — `axum::serve`'s future does nothing
+    // until polled.
+    let invoke_task = tokio::spawn(async move { invoke_server.await });
+    let admin_task = tokio::spawn(async move { admin_server.await });
+
     ready.store(true, std::sync::atomic::Ordering::SeqCst);
     ops::notify_ready();
     tracing::info!(
@@ -211,22 +239,47 @@ pub async fn run(cfg: AppConfig) -> ExitCode {
         "cf-rs serving"
     );
 
-    let signal_task = tokio::spawn(async move {
-        shutdown.wait_for_signal().await;
-    });
-
-    let (invoke_result, admin_result) = tokio::join!(invoke_server, admin_server);
+    // Graceful shutdown sequence (T061), per ops-config.md's signal table:
+    // STOPPING=1 -> invoke accept stops (already wired into the two
+    // `with_graceful_shutdown` futures above via the watch channel) ->
+    // in-flight requests get up to `shutdown_grace_secs` to finish -> every
+    // running function instance gets SIGTERM, up to `stop_grace_secs`, then
+    // SIGKILL -> process exits 0. `STOPPING=1` fires the moment the signal
+    // arrives, before anything else, so the service manager and any external
+    // monitoring see shutdown begin immediately rather than only once it has
+    // already finished.
+    shutdown.wait_for_signal().await;
     ops::notify_stopping();
-    let _ = signal_task.await;
+    tracing::info!("received shutdown signal; draining in-flight requests");
 
-    if let Err(err) = invoke_result {
-        tracing::error!(%err, "invoke listener terminated with an error");
-        return ExitCode::from(EXIT_RUNTIME_ERROR);
+    let shutdown_grace = Duration::from_secs(u64::from(cfg.invoke.shutdown_grace_secs));
+    match tokio::time::timeout(shutdown_grace, async {
+        tokio::join!(invoke_task, admin_task)
+    })
+    .await
+    {
+        Ok((invoke_result, admin_result)) => {
+            match invoke_result {
+                Ok(Err(err)) => tracing::error!(%err, "invoke listener terminated with an error"),
+                Err(err) => tracing::error!(%err, "invoke listener task panicked"),
+                Ok(Ok(())) => {}
+            }
+            match admin_result {
+                Ok(Err(err)) => tracing::error!(%err, "admin listener terminated with an error"),
+                Err(err) => tracing::error!(%err, "admin listener task panicked"),
+                Ok(Ok(())) => {}
+            }
+        }
+        Err(_) => {
+            tracing::warn!(
+                grace_secs = cfg.invoke.shutdown_grace_secs,
+                "shutdown_grace_secs exceeded with requests still in flight; forcing stop"
+            );
+        }
     }
-    if let Err(err) = admin_result {
-        tracing::error!(%err, "admin listener terminated with an error");
-        return ExitCode::from(EXIT_RUNTIME_ERROR);
-    }
+
+    let stop_grace = Duration::from_secs(u64::from(cfg.runtime.stop_grace_secs));
+    registry.shutdown_all_instances(stop_grace).await;
 
     ExitCode::from(EXIT_OK)
 }

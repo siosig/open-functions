@@ -72,6 +72,11 @@ impl Store for MemoryStore {
         Ok(builds.get(id).cloned())
     }
 
+    fn list_builds(&self) -> Result<Vec<Build>, StoreError> {
+        let builds = self.builds.read().unwrap_or_else(|e| e.into_inner());
+        Ok(builds.values().cloned().collect())
+    }
+
     fn get_binding(&self, name: &str) -> Result<Option<TriggerBinding>, StoreError> {
         let bindings = self.bindings.read().unwrap_or_else(|e| e.into_inner());
         Ok(bindings.get(name).cloned())
