@@ -28,6 +28,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::build::{BuildError, BuildRequest, Builder};
+use crate::logs::ring::LogStore;
 use crate::model::TriggerBinding;
 use crate::model::build::{Build, BuildMode, BuildStatus};
 use crate::model::function::{
@@ -138,6 +139,14 @@ pub enum DeleteError {
     Store(#[from] StoreError),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum StopError {
+    #[error("function {0:?} not found")]
+    NotFound(String),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
 /// Ties `Store` + `Builder` + `Driver` + per-function `InstancePool`s
 /// together. One `RegistryService` per running `cf-rs` process.
 pub struct RegistryService {
@@ -175,6 +184,11 @@ pub struct RegistryService {
     /// binding management entirely for `Trigger::Pubsub` functions (they
     /// still register and build normally, they just never receive events).
     pubsub: Option<PubsubBindingConfig>,
+    /// Per-function log ring buffers (T079/US5), shared with `process_driver`/
+    /// `container_driver` (both drain their instances' output into it) and
+    /// exposed read-only to `cf-rs`'s `admin.rs` `GET .../logs` (T081) via
+    /// [`RegistryService::log_buffer`].
+    log_store: Arc<LogStore>,
 }
 
 impl RegistryService {
@@ -192,6 +206,7 @@ impl RegistryService {
         build_timeout: Duration,
         defaults: RegistrationDefaults,
         pubsub: Option<PubsubBindingConfig>,
+        log_store: Arc<LogStore>,
     ) -> Self {
         Self {
             store,
@@ -211,7 +226,19 @@ impl RegistryService {
             reapers: Mutex::new(HashMap::new()),
             building: Mutex::new(std::collections::HashSet::new()),
             pubsub,
+            log_store,
         }
+    }
+
+    /// The ring buffer of recent log lines for `name` (T079/US5), for
+    /// `cf-rs`'s `GET .../logs?tail&follow` (T081). Always returns a buffer
+    /// (creating an empty one if this function has never logged anything
+    /// yet) rather than an `Option` -- an empty tail and "function has no
+    /// logs yet" are indistinguishable to a caller anyway, and the admin
+    /// handler already 404s separately on an unknown function name via
+    /// `RegistryService::get`.
+    pub fn log_buffer(&self, name: &str) -> Arc<crate::logs::ring::LogRingBuffer> {
+        self.log_store.buffer_for(name)
     }
 
     pub fn get(&self, name: &str) -> Result<Option<Function>, StoreError> {
@@ -407,6 +434,7 @@ impl RegistryService {
         let function = self.build_function_record(&req, existing.as_ref());
         validate::validate_function(&function)?;
         self.store.put_function(&function)?;
+        self.report_function_state_gauge();
 
         // FR-010: a Pub/Sub-triggered function's binding is created at
         // registration time, independent of whether the build succeeds —
@@ -452,17 +480,34 @@ impl RegistryService {
             timeout: self.build_timeout,
         };
 
+        let build_started = std::time::Instant::now();
         let build_outcome = builder.build(&build_request).await;
+        let build_mode_label: &'static str = match build_mode {
+            BuildMode::Host => "host",
+            BuildMode::Container => "container",
+        };
+        metrics::histogram!("cf_rs_build_duration_seconds", "mode" => build_mode_label)
+            .record(build_started.elapsed().as_secs_f64());
 
         let mut build_record = build;
         build_record.finished_at = Some(chrono::Utc::now());
         let (function_state, last_error, revision_ready) = match &build_outcome {
             Ok(()) => {
+                metrics::counter!(
+                    "cf_rs_builds_total",
+                    "function" => req.name.clone(), "mode" => build_mode_label, "result" => "ok",
+                )
+                .increment(1);
                 build_record.status = BuildStatus::Succeeded;
                 build_record.exit_code = Some(0);
                 (FunctionState::Ready, None, true)
             }
             Err(err) => {
+                metrics::counter!(
+                    "cf_rs_builds_total",
+                    "function" => req.name.clone(), "mode" => build_mode_label, "result" => "fail",
+                )
+                .increment(1);
                 build_record.status = BuildStatus::Failed;
                 build_record.exit_code = match err {
                     BuildError::NonZeroExit(code, _) => Some(*code),
@@ -508,6 +553,7 @@ impl RegistryService {
             updated.last_error = last_error;
             updated.updated_at = chrono::Utc::now();
             self.store.put_function(&updated)?;
+            self.report_function_state_gauge();
         }
 
         Ok(RegisterAccepted {
@@ -667,6 +713,7 @@ impl RegistryService {
             current.last_error = None;
             current.updated_at = chrono::Utc::now();
             self.store.put_function(&current)?;
+            self.report_function_state_gauge();
         }
 
         Ok(())
@@ -714,33 +761,48 @@ impl RegistryService {
         }
     }
 
-    /// Stops the function's instances, its idle reaper, removes it from the
-    /// store, and deletes its artifacts. Idempotent-ish: deleting an unknown
-    /// function is `DeleteError::NotFound`, matching `admin-api.md`'s 404.
+    /// Deletes a function (T080/US5), per `admin-api.md`'s `DELETE` contract
+    /// (`deleting` state -> instances stopped -> binding unbound -> artifacts
+    /// removed -> registry entry removed). Idempotent-ish: deleting an
+    /// unknown function is `DeleteError::NotFound`, matching `admin-api.md`'s
+    /// 404. Runs synchronously to completion (matching `register`'s own
+    /// synchronous-under-the-hood MVP shape, see this module's top doc
+    /// comment) rather than returning immediately and finishing in the
+    /// background -- `admin.rs`'s `202 {"state":"deleting"}` response is
+    /// therefore sent only once teardown has actually finished, and a `GET`
+    /// racing a concurrent `DELETE` can observe `state: deleting` only for
+    /// the (typically sub-second) window between persisting that state below
+    /// and the final `store.delete_function` a few lines later.
     pub async fn delete(&self, name: &str) -> Result<(), DeleteError> {
-        let existing = self.store.get_function(name)?;
-        let Some(existing) = existing else {
+        let Some(mut existing) = self.store.get_function(name)? else {
             return Err(DeleteError::NotFound(name.to_string()));
         };
 
-        if matches!(existing.trigger, Trigger::Pubsub { .. }) {
-            self.unbind_pubsub_trigger(name).await;
-        }
+        existing.state = FunctionState::Deleting;
+        existing.updated_at = chrono::Utc::now();
+        self.store.put_function(&existing)?;
+        self.report_function_state_gauge();
 
         if let Some(handle) = self.reapers.lock().await.remove(name) {
             handle.abort();
         }
         if let Some(pool) = self.pools.lock().await.remove(name) {
             pool.begin_drain().await;
-            // Best-effort: reap whatever's idle right now, and let anything
-            // still in-flight finish naturally (its permit drop doesn't stop
-            // the instance, but nothing new will be routed to it since the
-            // pool itself is being dropped along with the last `Arc` clone
-            // once any in-flight forwarder calls complete).
-            pool.reap_idle_once().await;
+            // Full stop (not just a reap of already-idle instances): wait
+            // for every instance to actually exit (SIGTERM -> grace ->
+            // SIGKILL, `InstancePool::stop_all`'s own semantics) before
+            // continuing, so a completed `delete()` really has scaled the
+            // function to zero, per admin-api.md's "stop instances" step.
+            pool.stop_all(Duration::from_secs(5)).await;
         }
 
+        if matches!(existing.trigger, Trigger::Pubsub { .. }) {
+            self.unbind_pubsub_trigger(name).await;
+        }
+
+        self.log_store.remove(name);
         self.store.delete_function(name)?;
+        self.report_function_state_gauge();
 
         let function_artifacts_dir = self.artifacts_dir.join(name);
         let _ = tokio::fs::remove_dir_all(&function_artifacts_dir).await;
@@ -748,6 +810,51 @@ impl RegistryService {
         let _ = tokio::fs::remove_dir_all(&function_build_dir).await;
 
         Ok(())
+    }
+
+    /// Stops every running instance of `name` (`POST .../:stop`, T081/US5) --
+    /// a forced scale-to-zero, distinct from [`RegistryService::delete`]:
+    /// the function itself, its bindings, and its artifacts are untouched,
+    /// and a subsequent invocation starts a fresh instance on demand exactly
+    /// as it would after an idle-reaper stop.
+    pub async fn stop_instances(&self, name: &str) -> Result<(), StopError> {
+        if self.store.get_function(name)?.is_none() {
+            return Err(StopError::NotFound(name.to_string()));
+        }
+        if let Some(pool) = self.pools.lock().await.get(name).cloned() {
+            pool.stop_all(Duration::from_secs(5)).await;
+        }
+        Ok(())
+    }
+
+    /// Refreshes the `cf_rs_functions{state}` gauge (T082/US5) from the
+    /// store's current contents. Called after every state-changing
+    /// operation (`register_source`, `register_image`, `activate_revision`,
+    /// `delete`) rather than incrementally tracked, since the number of
+    /// functions is always small enough that a full re-list is cheap and
+    /// this avoids the gauge ever drifting out of sync with reality.
+    fn report_function_state_gauge(&self) {
+        let functions = match self.store.list_functions() {
+            Ok(functions) => functions,
+            Err(err) => {
+                tracing::warn!(%err, "failed to list functions for cf_rs_functions gauge");
+                return;
+            }
+        };
+        let mut counts = [0u64; 4];
+        for f in &functions {
+            let idx = match f.state {
+                FunctionState::Building => 0,
+                FunctionState::Ready => 1,
+                FunctionState::Failed => 2,
+                FunctionState::Deleting => 3,
+            };
+            counts[idx] += 1;
+        }
+        metrics::gauge!("cf_rs_functions", "state" => "building").set(counts[0] as f64);
+        metrics::gauge!("cf_rs_functions", "state" => "ready").set(counts[1] as f64);
+        metrics::gauge!("cf_rs_functions", "state" => "failed").set(counts[2] as f64);
+        metrics::gauge!("cf_rs_functions", "state" => "deleting").set(counts[3] as f64);
     }
 }
 

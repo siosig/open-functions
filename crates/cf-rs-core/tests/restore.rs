@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use cf_rs_core::build::container::ContainerBuilder;
 use cf_rs_core::build::host_cargo::HostCargoBuilder;
+use cf_rs_core::logs::ring::LogStore;
 use cf_rs_core::model::build::{Build, BuildMode, BuildStatus};
 use cf_rs_core::model::function::{
     Function, FunctionState, QueuePolicy as ModelQueuePolicy, Source, Trigger,
@@ -91,9 +92,11 @@ fn new_registry(data_dir: &Path) -> (RegistryService, Arc<dyn Store>) {
     });
     let process_driver = Arc::new(ProcessDriver {
         limiter: Arc::new(CgroupLimiter::probe()),
+        log_store: Arc::new(LogStore::default()),
     });
     let container_driver = Arc::new(ContainerDriver {
         docker: docker::connect("").expect("connect (no daemon required to construct)"),
+        log_store: Arc::new(LogStore::default()),
     });
     let global_limit = Arc::new(tokio::sync::Semaphore::new(32));
 
@@ -110,6 +113,7 @@ fn new_registry(data_dir: &Path) -> (RegistryService, Arc<dyn Store>) {
         Duration::from_secs(1800),
         defaults(),
         None,
+        Arc::new(LogStore::default()),
     );
     (registry, store)
 }

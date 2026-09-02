@@ -161,3 +161,57 @@ where
     }
     Ok(())
 }
+
+/// Re-emits one parsed function log line through `tracing`, at the level its
+/// own `severity` maps to (GCP scale), with the `source="function"` label set
+/// ops-config.md's log-format table specifies (`source`, `function`,
+/// `revision`, `instance_id`, `execution_id`). Shared by
+/// `runtime::process::ProcessDriver` and `runtime::container::ContainerDriver`'s
+/// log-draining tasks (T037, extended US5 T079).
+pub fn emit_function_log(
+    function_name: &str,
+    revision: u32,
+    instance_id: &str,
+    record: &LogRecord,
+) {
+    let message = record.message.as_str();
+    let execution_id = record.execution_id.as_deref().unwrap_or("");
+    match record.severity.as_str() {
+        "DEBUG" => tracing::debug!(
+            target: "cf_rs::instance_stdout",
+            source = "function",
+            function = %function_name,
+            revision,
+            instance_id,
+            execution_id,
+            %message,
+        ),
+        "WARNING" => tracing::warn!(
+            target: "cf_rs::instance_stdout",
+            source = "function",
+            function = %function_name,
+            revision,
+            instance_id,
+            execution_id,
+            %message,
+        ),
+        "ERROR" | "CRITICAL" | "ALERT" | "EMERGENCY" => tracing::error!(
+            target: "cf_rs::instance_stdout",
+            source = "function",
+            function = %function_name,
+            revision,
+            instance_id,
+            execution_id,
+            %message,
+        ),
+        _ => tracing::info!(
+            target: "cf_rs::instance_stdout",
+            source = "function",
+            function = %function_name,
+            revision,
+            instance_id,
+            execution_id,
+            %message,
+        ),
+    }
+}

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use cf_rs_core::build::container::ContainerBuilder;
 use cf_rs_core::build::host_cargo::HostCargoBuilder;
+use cf_rs_core::logs::ring::LogStore;
 use cf_rs_core::model::function::QueuePolicy as ModelQueuePolicy;
 use cf_rs_core::pubsub::client::PsRsClient;
 use cf_rs_core::pubsub::reconcile::Reconciler;
@@ -47,6 +48,15 @@ pub async fn run(cfg: AppConfig) -> ExitCode {
             return ExitCode::from(EXIT_RUNTIME_ERROR);
         }
     };
+    // `cf_rs_build_info` (T082/US5): always 1, per ops-config.md. `git_sha` is
+    // "unknown" until a build.rs embeds it (not yet wired, see
+    // `cli::print_version`'s matching note); `version` is always accurate.
+    metrics::gauge!(
+        "cf_rs_build_info",
+        "version" => env!("CARGO_PKG_VERSION"),
+        "git_sha" => "unknown",
+    )
+    .set(1.0);
 
     if let Err(err) = std::fs::create_dir_all(&cfg.storage.data_dir) {
         tracing::error!(data_dir = %cfg.storage.data_dir, %err, "failed to create storage.data_dir");
@@ -77,6 +87,12 @@ pub async fn run(cfg: AppConfig) -> ExitCode {
         queue_max_wait_secs: cfg.defaults.queue_max_wait_secs,
     };
 
+    // Per-function log ring buffers (T079/US5), shared by both drivers (each
+    // drains its own instances' stdout/stderr into it) and by `RegistryService`
+    // (so `delete()` can forget a function's buffer, and `admin.rs`'s
+    // `GET .../logs` can read it via `RegistryService::log_buffer`).
+    let log_store = Arc::new(LogStore::new(cfg.log.function_ring_buffer_lines as usize));
+
     let host_builder = Arc::new(HostCargoBuilder {
         cargo_bin: cfg.build.cargo_bin.clone(),
     });
@@ -88,13 +104,19 @@ pub async fn run(cfg: AppConfig) -> ExitCode {
     } else {
         CgroupLimiter::probe()
     });
-    let process_driver = Arc::new(ProcessDriver { limiter });
+    let process_driver = Arc::new(ProcessDriver {
+        limiter,
+        log_store: Arc::clone(&log_store),
+    });
     // `docker::connect` only builds a client (cheap, infallible for a
     // well-formed socket path) -- it does not itself require a reachable
     // daemon, so this is safe to construct unconditionally even when
     // `build.mode = host` and/or the daemon never ends up running.
     let container_driver = match docker::connect(&cfg.runtime.docker_socket) {
-        Ok(client) => Arc::new(ContainerDriver { docker: client }),
+        Ok(client) => Arc::new(ContainerDriver {
+            docker: client,
+            log_store: Arc::clone(&log_store),
+        }),
         Err(err) => {
             tracing::error!(%err, "failed to construct the Docker client for image-mode support");
             return ExitCode::from(EXIT_CONFIG_ERROR);
@@ -180,6 +202,7 @@ pub async fn run(cfg: AppConfig) -> ExitCode {
         Duration::from_secs(u64::from(cfg.build.timeout_secs)),
         defaults,
         pubsub_binding,
+        Arc::clone(&log_store),
     ));
 
     let host_suffix = if cfg.invoke.host_suffix.is_empty() {

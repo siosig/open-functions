@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
 
+use cf_rs_core::logs::ring::LogStore;
 use cf_rs_core::pool::{AcquireError, InstancePool, PoolConfig, QueuePolicy};
 use cf_rs_core::runtime::InstanceSpec;
 use cf_rs_core::runtime::cgroup::CgroupLimiter;
@@ -71,6 +72,7 @@ fn base_spec(artifact_path: PathBuf) -> InstanceSpec {
 fn driver() -> Arc<ProcessDriver> {
     Arc::new(ProcessDriver {
         limiter: Arc::new(CgroupLimiter::probe()),
+        log_store: Arc::new(LogStore::default()),
     })
 }
 

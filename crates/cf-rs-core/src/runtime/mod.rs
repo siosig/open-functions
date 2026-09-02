@@ -111,6 +111,13 @@ pub trait Driver: Send + Sync {
     async fn is_available(&self) -> bool {
         true
     }
+
+    /// Label value for the `driver` label on `cf_rs_cold_start_seconds`
+    /// (T082/US5): `"process"` for `process::ProcessDriver`, `"container"`
+    /// for `container::ContainerDriver`.
+    fn kind(&self) -> &'static str {
+        "process"
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

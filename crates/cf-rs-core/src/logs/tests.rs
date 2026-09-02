@@ -1,4 +1,5 @@
 use super::pipe::{LogRecord, Stream, parse_line, pump};
+use super::ring::{LogRingBuffer, LogStore};
 
 #[test]
 fn well_formed_json_extracts_all_fields_and_preserves_extra() {
@@ -171,4 +172,81 @@ async fn pump_uses_fallback_execution_id_provider_per_line() {
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].execution_id.as_deref(), Some("exec-0"));
     assert_eq!(records[1].execution_id.as_deref(), Some("exec-1"));
+}
+
+// T077 (US5): per-function log ring buffer tests.
+
+fn record(msg: &str) -> LogRecord {
+    parse_line(msg, Stream::Stdout, None)
+}
+
+#[test]
+fn ring_buffer_tail_returns_most_recent_lines_oldest_first() {
+    let buf = LogRingBuffer::new(3);
+    for i in 0..5 {
+        buf.push(record(&format!("line {i}")));
+    }
+    let tail = buf.tail(10);
+    let messages: Vec<&str> = tail.iter().map(|r| r.message.as_str()).collect();
+    assert_eq!(messages, vec!["line 2", "line 3", "line 4"]);
+}
+
+#[test]
+fn ring_buffer_capacity_1000_default_matches_ops_config() {
+    let store = LogStore::default();
+    let buf = store.buffer_for("f");
+    for i in 0..1500 {
+        buf.push(record(&format!("{i}")));
+    }
+    let tail = buf.tail(2000);
+    assert_eq!(tail.len(), 1000);
+    assert_eq!(tail[0].message, "500");
+    assert_eq!(tail[999].message, "1499");
+}
+
+#[test]
+fn ring_buffer_tail_n_returns_only_last_n() {
+    let buf = LogRingBuffer::new(10);
+    for i in 0..5 {
+        buf.push(record(&i.to_string()));
+    }
+    let tail = buf.tail(2);
+    assert_eq!(tail.len(), 2);
+    assert_eq!(tail[0].message, "3");
+    assert_eq!(tail[1].message, "4");
+}
+
+#[tokio::test]
+async fn ring_buffer_follow_receives_only_lines_pushed_after_subscribe() {
+    let buf = LogRingBuffer::new(10);
+    buf.push(record("before"));
+    let mut rx = buf.subscribe();
+    buf.push(record("after"));
+    match rx.recv().await {
+        Ok(received) => assert_eq!(received.message, "after"),
+        Err(err) => panic!("follow stream should yield the new line, got {err:?}"),
+    }
+}
+
+#[test]
+fn log_store_isolates_buffers_per_function() {
+    let store = LogStore::new(10);
+    store.buffer_for("fn-a").push(record("a-line"));
+    store.buffer_for("fn-b").push(record("b-line"));
+
+    let a_tail = store.buffer_for("fn-a").tail(10);
+    let b_tail = store.buffer_for("fn-b").tail(10);
+    assert_eq!(a_tail.len(), 1);
+    assert_eq!(b_tail.len(), 1);
+    assert_eq!(a_tail[0].message, "a-line");
+    assert_eq!(b_tail[0].message, "b-line");
+}
+
+#[test]
+fn log_store_remove_yields_a_fresh_empty_buffer_on_next_use() {
+    let store = LogStore::new(10);
+    store.buffer_for("fn-a").push(record("old"));
+    store.remove("fn-a");
+    let fresh = store.buffer_for("fn-a");
+    assert_eq!(fresh.tail(10).len(), 0);
 }

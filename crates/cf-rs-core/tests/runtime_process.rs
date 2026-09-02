@@ -14,6 +14,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cf_rs_core::logs::ring::LogStore;
 use cf_rs_core::runtime::cgroup::CgroupLimiter;
 use cf_rs_core::runtime::process::ProcessDriver;
 use cf_rs_core::runtime::{Driver, DriverError, InstanceExit, InstanceSpec};
@@ -70,6 +71,7 @@ fn base_spec(artifact_path: PathBuf) -> InstanceSpec {
 fn driver() -> ProcessDriver {
     ProcessDriver {
         limiter: Arc::new(CgroupLimiter::probe()),
+        log_store: Arc::new(LogStore::default()),
     }
 }
 
@@ -184,4 +186,59 @@ async fn missing_artifact_fails_with_spawn_error_not_ready_timeout() {
 fn fixture_binary_path_is_examples_hello_http_release() {
     let binary = hello_http_binary();
     assert!(binary.ends_with(Path::new("examples/hello-http/target/release/hello-http")));
+}
+
+/// T079/US5: `ProcessDriver` must actually drain the child's stdout through
+/// `logs::pipe::pump` into the shared `LogStore`, not just to `tracing` --
+/// `examples/hello-http` logs `tracing::info!(%path, %query, "handling
+/// request")` via `cf-rs-sdk`'s structured JSON logging layer (T024) on
+/// every request, giving this test a real, well-formed JSON line to look
+/// for in the function's ring buffer after a single GET.
+#[tokio::test]
+async fn instance_stdout_is_retained_in_the_function_log_ring_buffer() {
+    let binary = hello_http_binary();
+    let log_store = Arc::new(LogStore::default());
+    let driver = ProcessDriver {
+        limiter: Arc::new(CgroupLimiter::probe()),
+        log_store: Arc::clone(&log_store),
+    };
+    let spec = base_spec(binary);
+
+    let handle = driver
+        .spawn(&spec)
+        .await
+        .expect("spawn should succeed for a valid hello-http artifact");
+
+    let resp = reqwest::get(format!("http://{}/ring-buffer-check", handle.addr))
+        .await
+        .expect("HTTP GET to the instance should succeed");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // The SDK's logging layer writes one JSON line per event; give the
+    // background drain task a moment to read and parse it (it races the
+    // response being sent, not this test's own await points).
+    let buffer = log_store.buffer_for(&spec.function_name);
+    let mut found = false;
+    for _ in 0..50 {
+        if buffer
+            .tail(100)
+            .iter()
+            .any(|record| record.message == "handling request")
+        {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        found,
+        "expected a \"handling request\" line in the function's log ring buffer, got: {:?}",
+        buffer
+            .tail(100)
+            .iter()
+            .map(|r| &r.message)
+            .collect::<Vec<_>>()
+    );
+
+    let _ = handle.stop(Duration::from_secs(5)).await;
 }

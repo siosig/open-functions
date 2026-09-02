@@ -1,24 +1,25 @@
 //! Admin listener: `/healthz`, `/readyz`, `/metrics`, Bearer-token middleware
-//! guarding `/v1/*`, and the `/v1/functions/*` management API (T041). See
-//! `contracts/admin-api.md`.
-//!
-//! Build-log `follow` and `/v1/functions/{name}/logs` (function invocation
-//! logs) are US5's job (T081, ring buffer from T079) — not implemented here;
-//! `GET .../builds/{id}/log` returns the log file's current contents as a
-//! single response rather than a live chunked stream, a deliberate MVP
-//! simplification for User Story 1.
+//! guarding `/v1/*`, and the `/v1/functions/*` management API (T041, extended
+//! US5's T081: `GET .../logs`, `POST .../:stop`, and `follow` support on both
+//! the build log and the function log endpoints). See `contracts/admin-api.md`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json};
 use axum::routing::get;
 use axum::{Router, middleware};
+use cf_rs_core::logs::pipe::LogRecord;
+use cf_rs_core::model::build::BuildStatus;
 use cf_rs_core::model::function::{Function, Source, Trigger};
-use cf_rs_core::registry::service::{DeleteError, RegisterError, RegisterRequest, RegistryService};
+use cf_rs_core::registry::service::{
+    DeleteError, RegisterError, RegisterRequest, RegistryService, StopError,
+};
 use cf_rs_core::registry::store::StoreError;
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -57,6 +58,16 @@ pub fn router(state: AdminState) -> Router {
             "/functions/{name}/builds/{build_id}/log",
             get(get_build_log),
         )
+        .route("/functions/{name}/logs", get(get_function_logs))
+        // admin-api.md specifies `POST /v1/functions/{name}:stop` (Google's
+        // custom-method colon convention), but axum 0.8.9 pins `matchit`
+        // to `=0.8.4`, whose router rejects a literal suffix sharing a path
+        // segment with a named param ("Only one parameter is allowed per
+        // path segment") -- a later matchit (0.8.6+) lifts this, but axum
+        // itself hard-pins the version, leaving no way to opt in from this
+        // crate. `/functions/{name}/stop` is the closest routable
+        // equivalent; `AdminClient::stop` and `fn stop` use this same path.
+        .route("/functions/{name}/stop", axum::routing::post(stop_function))
         .layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()
@@ -295,9 +306,29 @@ async fn get_function(
                 Ok(binding) => binding,
                 Err(err) => return store_error_response(&err),
             };
+            // `None` for an image-mode function's current revision (it never
+            // has a `Build` -- see `registry::service::register_image`) or a
+            // function that has never successfully deployed a revision;
+            // `fn build-log` without `--build` uses this to find the build
+            // to show.
+            let current_build_id = match function.current_revision {
+                Some(rev) => state
+                    .registry
+                    .get_revision(&name, rev)
+                    .ok()
+                    .flatten()
+                    .and_then(|r| r.build_id),
+                None => None,
+            };
             (
                 StatusCode::OK,
-                Json(function_detail_json(&state, &function, instances, binding)),
+                Json(function_detail_json(
+                    &state,
+                    &function,
+                    instances,
+                    binding,
+                    current_build_id,
+                )),
             )
                 .into_response()
         }
@@ -341,22 +372,199 @@ async fn get_build(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct FollowQuery {
+    #[serde(default)]
+    follow: Option<bool>,
+}
+
+/// `GET /v1/functions/{name}/builds/{build_id}/log[?follow=true]`. Without
+/// `follow`, returns the log file's current contents as a single response
+/// (T041's original MVP behavior). With `follow=true` (T081/US5), streams
+/// the file's growth in a chunked response until the build is no longer
+/// `running`, per admin-api.md.
 async fn get_build_log(
     State(state): State<AdminState>,
     Path((_name, build_id)): Path<(String, String)>,
+    Query(query): Query<FollowQuery>,
 ) -> axum::response::Response {
     let build = match state.registry.get_build(&build_id) {
         Ok(Some(build)) => build,
         Ok(None) => return api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "build not found"),
         Err(err) => return store_error_response(&err),
     };
-    match tokio::fs::read_to_string(&build.log_path).await {
-        Ok(contents) => (StatusCode::OK, contents).into_response(),
-        Err(err) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL",
-            format!("failed to read build log: {err}"),
-        ),
+
+    if !query.follow.unwrap_or(false) {
+        return match tokio::fs::read_to_string(&build.log_path).await {
+            Ok(contents) => (StatusCode::OK, contents).into_response(),
+            Err(err) => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL",
+                format!("failed to read build log: {err}"),
+            ),
+        };
+    }
+
+    let registry = Arc::clone(&state.registry);
+    let log_path = std::path::PathBuf::from(build.log_path);
+    let state_tuple = (registry, build_id, log_path, 0u64, build.status);
+    let stream = futures_util::stream::unfold(state_tuple, |state| async move {
+        follow_build_log_step(state).await
+    });
+    let body = axum::body::Body::from_stream(stream.map(Ok::<_, std::io::Error>));
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
+/// One step of the `follow=true` build-log stream: reads whatever new bytes
+/// have been appended to the log file since `offset`, yielding them if
+/// non-empty; if there's nothing new yet and the build has already finished
+/// (`status != Running`), ends the stream; otherwise waits briefly and
+/// re-checks the build's status before trying again.
+async fn follow_build_log_step(
+    (registry, build_id, log_path, mut offset, mut status): (
+        Arc<RegistryService>,
+        String,
+        std::path::PathBuf,
+        u64,
+        BuildStatus,
+    ),
+) -> Option<(
+    Vec<u8>,
+    (
+        Arc<RegistryService>,
+        String,
+        std::path::PathBuf,
+        u64,
+        BuildStatus,
+    ),
+)> {
+    loop {
+        let chunk = read_new_bytes(&log_path, &mut offset).await;
+        if !chunk.is_empty() {
+            return Some((chunk, (registry, build_id, log_path, offset, status)));
+        }
+        if status != BuildStatus::Running {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if let Ok(Some(build)) = registry.get_build(&build_id) {
+            status = build.status;
+        }
+    }
+}
+
+/// Reads any bytes appended to the file at `path` since `*offset`, advancing
+/// `*offset` past them. A file that doesn't exist yet (the builder hasn't
+/// created it) or a transient read error is treated as "nothing new yet"
+/// rather than a stream-ending error, since `follow_build_log_step`'s caller
+/// only stops on the build's own recorded status.
+async fn read_new_bytes(path: &std::path::Path, offset: &mut u64) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
+        return Vec::new();
+    };
+    if file.seek(std::io::SeekFrom::Start(*offset)).await.is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    match file.read_to_end(&mut buf).await {
+        Ok(n) => {
+            *offset += n as u64;
+            buf
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    #[serde(default)]
+    tail: Option<usize>,
+    #[serde(default)]
+    follow: Option<bool>,
+}
+
+/// `GET /v1/functions/{name}/logs?tail=100&follow=false` (T081/US5): the
+/// function's recent log lines from its ring buffer (T079), as
+/// `application/x-ndjson` -- one JSON-encoded [`LogRecord`] per line.
+/// `follow=true` keeps the connection open and streams new lines as they
+/// arrive (a lagged follower, per `tokio::sync::broadcast`'s semantics,
+/// silently skips ahead rather than erroring the stream).
+async fn get_function_logs(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    Query(query): Query<LogsQuery>,
+) -> axum::response::Response {
+    match state.registry.get(&name) {
+        Ok(None) => return function_not_found(&name),
+        Err(err) => return store_error_response(&err),
+        Ok(Some(_)) => {}
+    }
+
+    let buffer = state.registry.log_buffer(&name);
+    let initial = buffer.tail(query.tail.unwrap_or(100));
+
+    if !query.follow.unwrap_or(false) {
+        let mut body = Vec::new();
+        for record in &initial {
+            append_ndjson_line(&mut body, record);
+        }
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/x-ndjson")],
+            body,
+        )
+            .into_response();
+    }
+
+    let rx = buffer.subscribe();
+    let live = futures_util::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(record) => return Some((record, rx)),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    let body_stream = futures_util::stream::iter(initial)
+        .chain(live)
+        .map(|record| {
+            let mut line = Vec::new();
+            append_ndjson_line(&mut line, &record);
+            Ok::<_, std::io::Error>(line)
+        });
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/x-ndjson")],
+        axum::body::Body::from_stream(body_stream),
+    )
+        .into_response()
+}
+
+fn append_ndjson_line(buf: &mut Vec<u8>, record: &LogRecord) {
+    if let Ok(mut line) = serde_json::to_vec(record) {
+        buf.append(&mut line);
+        buf.push(b'\n');
+    }
+}
+
+/// `POST /v1/functions/{name}:stop` (T081/US5): forces every running
+/// instance of `name` to stop (scale to zero), without touching the
+/// function's registration, bindings, or artifacts.
+async fn stop_function(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    match state.registry.stop_instances(&name).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"stopped": true}))).into_response(),
+        Err(StopError::NotFound(name)) => function_not_found(&name),
+        Err(StopError::Store(err)) => store_error_response(&err),
     }
 }
 
@@ -395,6 +603,7 @@ fn function_detail_json(
     f: &Function,
     instances: usize,
     binding: Option<cf_rs_core::model::TriggerBinding>,
+    current_build_id: Option<String>,
 ) -> serde_json::Value {
     let path_url = format!("{}/{}", state.invoke_base_url.trim_end_matches('/'), f.name);
     let host_url = state.host_suffix.as_ref().map(|suffix| {
@@ -427,6 +636,7 @@ fn function_detail_json(
         "queue_max_wait_secs": f.queue_max_wait_secs,
         "state": f.state,
         "current_revision": f.current_revision,
+        "current_build_id": current_build_id,
         "last_error": f.last_error,
         "urls": {
             "path": path_url,

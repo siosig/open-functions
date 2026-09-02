@@ -135,8 +135,11 @@ struct PoolState {
 /// Manages instances for one function. See the module docs for the overall
 /// design and the crash-detection rationale.
 pub struct InstancePool {
-    #[allow(dead_code)] // not read yet; kept for logging/metrics call sites to come.
     function_name: String,
+    /// Label value for `cf_rs_cold_start_seconds{driver}` (T082/US5):
+    /// `driver.kind()`, captured once at construction since a pool's driver
+    /// never changes over its lifetime.
+    driver_kind: &'static str,
     driver: Arc<dyn Driver>,
     config: PoolConfig,
     inner: Mutex<PoolState>,
@@ -177,6 +180,7 @@ impl InstancePool {
     ) -> Self {
         Self {
             function_name,
+            driver_kind: driver.kind(),
             driver,
             config,
             global_limit: global_instance_limit,
@@ -219,11 +223,13 @@ impl InstancePool {
     pub async fn stop_all(&self, grace: Duration) {
         let handles: Vec<InstanceHandle> = {
             let mut state = self.inner.lock().await;
-            state
+            let handles = state
                 .instances
                 .drain()
                 .filter_map(|(_, mut inst)| inst.handle.take())
-                .collect()
+                .collect();
+            self.report_instance_count_gauge(0);
+            handles
         };
         let mut tasks = Vec::with_capacity(handles.len());
         for handle in handles {
@@ -251,6 +257,8 @@ impl InstancePool {
         let wait_start = Instant::now();
         loop {
             if let Some(acquired) = self.try_acquire_existing().await {
+                metrics::histogram!("cf_rs_queue_wait_seconds", "function" => self.function_name.clone())
+                    .record(wait_start.elapsed().as_secs_f64());
                 return Ok(acquired);
             }
 
@@ -322,21 +330,40 @@ impl InstancePool {
     pub async fn report_dead(&self, addr: SocketAddr) {
         let removed = {
             let mut state = self.inner.lock().await;
-            state.instances.remove(&addr)
+            let removed = state.instances.remove(&addr);
+            self.report_instance_count_gauge(state.instances.len());
+            removed
         };
-        if let Some(mut inst) = removed
-            && let Some(handle) = inst.handle.take()
-        {
-            // Drive the handle to completion in the background so this
-            // call doesn't block; we already know the instance is dead,
-            // this just lets the driver's own bookkeeping (e.g. process
-            // reaping) finish cleanly.
-            tokio::spawn(async move {
-                let _ = handle.wait().await;
-            });
+        if let Some(mut inst) = removed {
+            metrics::counter!("cf_rs_instance_crashes_total", "function" => self.function_name.clone())
+                .increment(1);
+            if let Some(handle) = inst.handle.take() {
+                // Drive the handle to completion in the background so this
+                // call doesn't block; we already know the instance is dead,
+                // this just lets the driver's own bookkeeping (e.g. process
+                // reaping) finish cleanly.
+                tokio::spawn(async move {
+                    let _ = handle.wait().await;
+                });
+            }
         }
         // `inst` (and its `_global_permit`), if any, has already dropped by
         // now, releasing the global slot.
+    }
+
+    /// Refreshes `cf_rs_instances{function,state="ready"}` (T082/US5) after a
+    /// change to the tracked instance count. This pool doesn't distinguish a
+    /// separate "starting" state from "ready" (an instance only enters
+    /// `state.instances` once `driver.spawn()` has already confirmed
+    /// readiness), so `"ready"` is the only state value this pool ever
+    /// reports.
+    fn report_instance_count_gauge(&self, count: usize) {
+        metrics::gauge!(
+            "cf_rs_instances",
+            "function" => self.function_name.clone(),
+            "state" => "ready",
+        )
+        .set(count as f64);
     }
 
     /// Background task: every 30s, stops instances idle past
@@ -394,6 +421,7 @@ impl InstancePool {
                     removable -= 1;
                 }
             }
+            self.report_instance_count_gauge(state.instances.len());
             stopped
         };
 
@@ -467,6 +495,7 @@ impl InstancePool {
         permit: OwnedSemaphorePermit,
         spec: InstanceSpec,
     ) -> Result<(), DriverError> {
+        let spawn_start = Instant::now();
         let result = self.driver.spawn(&spec).await;
 
         let mut state = self.inner.lock().await;
@@ -474,6 +503,10 @@ impl InstancePool {
 
         let outcome = match result {
             Ok(handle) => {
+                metrics::counter!("cf_rs_instance_starts_total", "function" => self.function_name.clone(), "result" => "ok")
+                    .increment(1);
+                metrics::histogram!("cf_rs_cold_start_seconds", "function" => self.function_name.clone(), "driver" => self.driver_kind)
+                    .record(spawn_start.elapsed().as_secs_f64());
                 let addr = handle.addr;
                 state.instances.insert(
                     addr,
@@ -484,9 +517,12 @@ impl InstancePool {
                         _global_permit: permit,
                     },
                 );
+                self.report_instance_count_gauge(state.instances.len());
                 Ok(())
             }
             Err(e) => {
+                metrics::counter!("cf_rs_instance_starts_total", "function" => self.function_name.clone(), "result" => "fail")
+                    .increment(1);
                 // `permit` drops here (falls out of scope unstored),
                 // releasing the global slot back for someone else.
                 Err(e)

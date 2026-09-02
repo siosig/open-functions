@@ -8,15 +8,22 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::AsyncRead;
 use tokio::process::Command;
 use tokio::sync::oneshot;
+
+use crate::logs::pipe::{self, Stream as LogStream};
+use crate::logs::ring::LogStore;
 
 use super::cgroup::CgroupLimiter;
 use super::{Driver, DriverError, InstanceExit, InstanceHandle, InstanceSpec, readiness};
 
 pub struct ProcessDriver {
     pub limiter: Arc<CgroupLimiter>,
+    /// Per-function log ring buffers (T079/US5) every instance's stdout/
+    /// stderr is drained into, in addition to the existing `tracing`
+    /// re-emission -- see `spawn_log_drain`.
+    pub log_store: Arc<LogStore>,
 }
 
 #[async_trait::async_trait]
@@ -105,17 +112,21 @@ impl Driver for ProcessDriver {
         if let Some(stdout) = stdout {
             spawn_log_drain(
                 stdout,
-                "stdout",
+                LogStream::Stdout,
                 spec.function_name.clone(),
+                spec.revision,
                 instance_id.clone(),
+                Arc::clone(&self.log_store),
             );
         }
         if let Some(stderr) = stderr {
             spawn_log_drain(
                 stderr,
-                "stderr",
+                LogStream::Stderr,
                 spec.function_name.clone(),
+                spec.revision,
                 instance_id.clone(),
+                Arc::clone(&self.log_store),
             );
         }
 
@@ -180,34 +191,40 @@ fn send_sigterm(pid: Option<u32>) {
     }
 }
 
-/// Drains a piped child stdout/stderr line-by-line, so the child never blocks
-/// on a full pipe buffer, and passes each line through to `tracing` at a
-/// basic level. `T037`'s `LogPipe` will properly parse/structure this later;
-/// this is just drain + passthrough.
-fn spawn_log_drain<R>(reader: R, stream: &'static str, function_name: String, instance_id: String)
-where
+/// Drains a piped child stdout/stderr line-by-line (so the child never
+/// blocks on a full pipe buffer), parsing each line via
+/// [`pipe::parse_line`] (T037/T079): re-emits it through `tracing` at the
+/// parsed severity (per ops-config.md's log-format table: `source="function"`,
+/// `function`, `revision`, `instance_id`, `execution_id`), and retains it in
+/// this function's [`LogStore`] ring buffer for `GET .../logs` (T081).
+fn spawn_log_drain<R>(
+    reader: R,
+    stream: LogStream,
+    function_name: String,
+    revision: u32,
+    instance_id: String,
+    log_store: Arc<LogStore>,
+) where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if stream == "stderr" {
-                tracing::warn!(
-                    target: "cf_rs::instance_stdout",
-                    function = %function_name,
-                    instance = %instance_id,
-                    stream,
-                    %line,
-                );
-            } else {
-                tracing::info!(
-                    target: "cf_rs::instance_stdout",
-                    function = %function_name,
-                    instance = %instance_id,
-                    stream,
-                    %line,
-                );
-            }
-        }
+        let buffer = log_store.buffer_for(&function_name);
+        // No fallback execution id: function-contract.md explicitly says
+        // attributing a line without its own `labels.execution_id` to "the
+        // instance's last known execution id" must not be attempted when
+        // concurrent executions could be in flight, and this driver has no
+        // per-instance "current execution id" tracking to do so safely even
+        // at concurrency=1 -- only a line the function itself stamped (via
+        // cf-rs-sdk's structured logging layer, T024) carries one.
+        let _ = pipe::pump(
+            reader,
+            stream,
+            || None,
+            |record| {
+                pipe::emit_function_log(&function_name, revision, &instance_id, &record);
+                buffer.push(record);
+            },
+        )
+        .await;
     });
 }

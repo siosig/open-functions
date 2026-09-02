@@ -11,17 +11,22 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bollard::Docker;
+use bollard::container::LogOutput;
 use bollard::models::{ContainerCreateBody, ContainerWaitResponse, HostConfig};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, InspectContainerOptionsBuilder,
-    ListContainersOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
-    StopContainerOptionsBuilder, WaitContainerOptionsBuilder,
+    ListContainersOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
+    StartContainerOptions, StopContainerOptionsBuilder, WaitContainerOptionsBuilder,
 };
 use futures_util::StreamExt;
 use tokio::sync::oneshot;
+
+use crate::logs::pipe::{self, Stream as LogStream};
+use crate::logs::ring::{LogRingBuffer, LogStore};
 
 use super::docker::{LABEL_FUNCTION, NETWORK_NAME, ensure_network};
 use super::{Driver, DriverError, InstanceExit, InstanceHandle, InstanceSpec, readiness};
@@ -48,11 +53,18 @@ const DEFAULT_STOP_GRACE_SECS: i32 = 5;
 /// not relying on a one-time startup call having happened first.
 pub struct ContainerDriver {
     pub docker: Docker,
+    /// Per-function log ring buffers (T079/US5): every container's stdout/
+    /// stderr is drained into it, mirroring `ProcessDriver`'s
+    /// `spawn_log_drain` -- see `spawn_container_log_drain` below.
+    pub log_store: Arc<LogStore>,
 }
 
 impl ContainerDriver {
     pub fn new(docker: Docker) -> Self {
-        Self { docker }
+        Self {
+            docker,
+            log_store: Arc::new(LogStore::default()),
+        }
     }
 }
 
@@ -60,6 +72,10 @@ impl ContainerDriver {
 impl Driver for ContainerDriver {
     async fn is_available(&self) -> bool {
         super::docker::is_available(&self.docker).await
+    }
+
+    fn kind(&self) -> &'static str {
+        "container"
     }
 
     async fn spawn(&self, spec: &InstanceSpec) -> Result<InstanceHandle, DriverError> {
@@ -149,6 +165,14 @@ impl Driver for ContainerDriver {
                 return Err(DriverError::ExitedBeforeReady(code));
             }
         }
+
+        spawn_container_log_drain(
+            self.docker.clone(),
+            container_id.clone(),
+            spec.function_name.clone(),
+            spec.revision,
+            Arc::clone(&self.log_store),
+        );
 
         let (stop_tx, mut stop_rx) = oneshot::channel::<Duration>();
         let (exit_tx, exit_rx) = oneshot::channel::<InstanceExit>();
@@ -378,6 +402,87 @@ pub async fn sweep_stale_containers(docker: &Docker) -> Result<usize, bollard::e
         }
     }
     Ok(removed)
+}
+
+/// Drains a container's combined stdout/stderr via `docker.logs(...,
+/// follow=true)` (T073's plan.md note: "logs stream -> LogPipe", never
+/// actually wired until T079/US5), splitting each `LogOutput` chunk into
+/// lines and feeding them through the same [`pipe::parse_line`] +
+/// [`pipe::emit_function_log`] + [`LogRingBuffer::push`] pipeline
+/// `runtime::process::ProcessDriver`'s `spawn_log_drain` uses. Runs until the
+/// log stream ends (the container is removed) or errors.
+fn spawn_container_log_drain(
+    docker: Docker,
+    container_id: String,
+    function_name: String,
+    revision: u32,
+    log_store: Arc<LogStore>,
+) {
+    tokio::spawn(async move {
+        let buffer = log_store.buffer_for(&function_name);
+        let options = LogsOptionsBuilder::default()
+            .follow(true)
+            .stdout(true)
+            .stderr(true)
+            .build();
+        let mut stream = docker.logs(&container_id, Some(options));
+        let mut stdout_buf = String::new();
+        let mut stderr_buf = String::new();
+        while let Some(item) = stream.next().await {
+            let Ok(chunk) = item else { break };
+            match chunk {
+                LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                    feed_lines(
+                        &mut stdout_buf,
+                        &message,
+                        LogStream::Stdout,
+                        &function_name,
+                        revision,
+                        &container_id,
+                        &buffer,
+                    );
+                }
+                LogOutput::StdErr { message } => {
+                    feed_lines(
+                        &mut stderr_buf,
+                        &message,
+                        LogStream::Stderr,
+                        &function_name,
+                        revision,
+                        &container_id,
+                        &buffer,
+                    );
+                }
+                LogOutput::StdIn { .. } => {}
+            }
+        }
+    });
+}
+
+/// Appends `chunk` to `buf` and drains every complete (`\n`-terminated) line
+/// out of it, parsing and retaining each one. A trailing partial line (no
+/// `\n` yet) stays in `buf` for the next chunk -- Docker's log stream makes
+/// no line-alignment guarantee per frame.
+fn feed_lines(
+    buf: &mut String,
+    chunk: &[u8],
+    stream: LogStream,
+    function_name: &str,
+    revision: u32,
+    instance_id: &str,
+    ring: &LogRingBuffer,
+) {
+    buf.push_str(&String::from_utf8_lossy(chunk));
+    while let Some(pos) = buf.find('\n') {
+        let line: String = buf.drain(..=pos).collect();
+        let line = line.trim_end_matches('\n');
+        if line.is_empty() {
+            continue;
+        }
+        let record = pipe::parse_line(line, stream, None);
+        pipe::emit_function_log(function_name, revision, instance_id, &record);
+        ring.push(record);
+    }
 }
 
 /// Wraps any displayable error as `DriverError::Spawn`, the only `DriverError`

@@ -128,4 +128,85 @@ impl AdminClient {
         }
         Ok(text)
     }
+
+    pub async fn list(&self) -> Result<Value, ClientError> {
+        let builder = self.http.get(self.url("/v1/functions"));
+        self.send(builder).await
+    }
+
+    pub async fn delete(&self, name: &str) -> Result<Value, ClientError> {
+        let builder = self.http.delete(self.url(&format!("/v1/functions/{name}")));
+        self.send(builder).await
+    }
+
+    /// `POST /v1/functions/{name}/stop` -- admin-api.md specifies
+    /// `{name}:stop`, but see `server::admin::router`'s doc comment on why
+    /// this crate's actual route (and this client call) uses `/stop`
+    /// instead (an axum/matchit version constraint, not a design choice).
+    pub async fn stop(&self, name: &str) -> Result<Value, ClientError> {
+        let builder = self
+            .http
+            .post(self.url(&format!("/v1/functions/{name}/stop")));
+        self.send(builder).await
+    }
+
+    /// Opens `GET .../builds/{build_id}/log?follow=true` and returns the raw
+    /// response for the caller to stream byte chunks from
+    /// (`Response::bytes_stream`, requires the `stream` build-log/log
+    /// endpoints share) -- unlike [`AdminClient::send`]/[`AdminClient::get_build_log`],
+    /// this deliberately has no request timeout: a `follow` stream is
+    /// expected to stay open indefinitely until the server ends it (build
+    /// finished) or the caller (e.g. Ctrl-C) gives up.
+    pub async fn follow_build_log(
+        &self,
+        name: &str,
+        build_id: &str,
+    ) -> Result<reqwest::Response, ClientError> {
+        self.get_stream(&format!(
+            "/v1/functions/{name}/builds/{build_id}/log?follow=true"
+        ))
+        .await
+    }
+
+    /// Opens `GET .../logs?tail=<n>&follow=<bool>` and returns the raw
+    /// response for the caller to stream ndjson lines from.
+    pub async fn function_logs(
+        &self,
+        name: &str,
+        tail: usize,
+        follow: bool,
+    ) -> Result<reqwest::Response, ClientError> {
+        self.get_stream(&format!(
+            "/v1/functions/{name}/logs?tail={tail}&follow={follow}"
+        ))
+        .await
+    }
+
+    /// Shared GET-and-check-status helper for the two streaming endpoints
+    /// above: unlike [`AdminClient::send`], returns the raw [`reqwest::Response`]
+    /// (for the caller to read as a byte stream) instead of buffering and
+    /// parsing a JSON body, and has no fixed request timeout.
+    async fn get_stream(&self, path_and_query: &str) -> Result<reqwest::Response, ClientError> {
+        let url_for_err = self.base_url.clone();
+        let resp = self
+            .authorize(self.http.get(self.url(path_and_query)))
+            .send()
+            .await
+            .map_err(|source| ClientError::Unreachable {
+                url: url_for_err,
+                source,
+            })?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(ClientError::Unauthorized);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::ApiError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(resp)
+    }
 }

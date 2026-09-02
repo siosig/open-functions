@@ -2,12 +2,17 @@
 //!
 //! `serve` / `check-config` / `health` / `version` are Foundational-phase.
 //! `fn deploy` / `fn describe` are T043 (User Story 1); `fn list` / `delete` /
-//! `logs` / `build-log` / `stop` land with later user-story tasks (T056,
-//! T076, T083) as this enum grows.
+//! `logs` / `build-log` / `stop` are T083 (User Story 5).
 
 mod client;
+mod fn_build_log;
+mod fn_delete;
 mod fn_deploy;
 mod fn_describe;
+mod fn_list;
+mod fn_logs;
+mod fn_stop;
+mod output;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -52,6 +57,17 @@ enum FnCommand {
     Deploy(fn_deploy::DeployArgs),
     /// Print a function's current detail.
     Describe(fn_describe::DescribeArgs),
+    /// List all registered functions.
+    List(fn_list::ListArgs),
+    /// Delete a function (stop its instances, unbind its trigger, remove its
+    /// artifacts).
+    Delete(fn_delete::DeleteArgs),
+    /// Print or follow a function's recent invocation logs.
+    Logs(fn_logs::LogsArgs),
+    /// Print or follow a build's log.
+    BuildLog(fn_build_log::BuildLogArgs),
+    /// Stop every running instance of a function (scale to zero).
+    Stop(fn_stop::StopArgs),
 }
 
 #[derive(clap::Args)]
@@ -109,6 +125,11 @@ fn run_fn(command: FnCommand) -> ExitCode {
     match command {
         FnCommand::Deploy(args) => fn_deploy::run(&client, args),
         FnCommand::Describe(args) => fn_describe::run(&client, args),
+        FnCommand::List(args) => fn_list::run(&client, args),
+        FnCommand::Delete(args) => fn_delete::run(&client, args),
+        FnCommand::Logs(args) => fn_logs::run(&client, args),
+        FnCommand::BuildLog(args) => fn_build_log::run(&client, args),
+        FnCommand::Stop(args) => fn_stop::run(&client, args),
     }
 }
 

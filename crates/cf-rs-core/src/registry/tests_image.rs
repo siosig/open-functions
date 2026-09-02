@@ -60,9 +60,11 @@ fn registry_with_docker_socket(data_dir: &std::path::Path, docker_socket: &str) 
     });
     let process_driver = Arc::new(ProcessDriver {
         limiter: Arc::new(CgroupLimiter::probe()),
+        log_store: Arc::new(crate::logs::ring::LogStore::default()),
     });
     let container_driver = Arc::new(ContainerDriver {
         docker: ok(docker::connect(docker_socket), "connect"),
+        log_store: Arc::new(crate::logs::ring::LogStore::default()),
     });
     let global_limit = Arc::new(Semaphore::new(8));
 
@@ -79,6 +81,7 @@ fn registry_with_docker_socket(data_dir: &std::path::Path, docker_socket: &str) 
         Duration::from_secs(300),
         defaults(),
         None,
+        Arc::new(crate::logs::ring::LogStore::default()),
     )
 }
 
