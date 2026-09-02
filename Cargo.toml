@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = ["crates/cf-rs-sdk", "crates/cf-rs-core", "crates/cf-rs"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/cf-rs"
+
+[workspace.dependencies]
+cf-rs-sdk = { path = "crates/cf-rs-sdk" }
+cf-rs-core = { path = "crates/cf-rs-core" }
+
+tokio = { version = "1.53", features = ["full"] }
+axum = "0.8.9"
+hyper = "1.11"
+hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "tokio"] }
+tower = "0.5"
+tower-http = "0.7"
+http = "1.2"
+http-body-util = "0.1"
+
+cloudevents-sdk = { version = "0.9.0", features = ["axum", "http-binding"] }
+bollard = "0.21.1"
+cgroups-rs = "0.5.1"
+redb = "4.2.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
+
+config = "0.15.25"
+clap = { version = "4.6", features = ["derive", "env"] }
+
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-journald = "0.3"
+
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18.3"
+sd-notify = "0.5.0"
+
+async-trait = "0.1"
+thiserror = "2.0.20"
+anyhow = "1.0.104"
+uuid = { version = "1.26", features = ["v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.151"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+
+proptest = "1"
+wiremock = "0.6"
+assert_cmd = "2"
+predicates = "3"
+criterion = "0.7"
+tempfile = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true

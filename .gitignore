@@ -6,3 +6,15 @@
 
 # secretlint local-only denylist (company/personal terms — never committed)
 .secretlintrc.local.json
+
+# Rust
+/target/
+/target-agents/
+# example fixtures are standalone crates (their own [workspace] table), so a
+# bare `cargo build` inside one puts output in its own target/ rather than
+# the root one above
+examples/*/target/
+
+# local scratch
+/tmp/
+
