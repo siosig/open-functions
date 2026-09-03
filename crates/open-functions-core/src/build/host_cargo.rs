@@ -3,7 +3,7 @@
 use std::process::Stdio;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{ChildStderr, ChildStdout, Command};
 
 use crate::build::{BuildError, BuildRequest, Builder, metadata};
 
@@ -43,7 +43,7 @@ impl Builder for HostCargoBuilder {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let mut log_file = tokio::fs::File::create(&request.log_path).await?;
+        let log_file = tokio::fs::File::create(&request.log_path).await?;
 
         let mut child = Command::new(&self.cargo_bin)
             .arg("build")
@@ -67,49 +67,21 @@ impl Builder for HostCargoBuilder {
             .take()
             .ok_or_else(|| BuildError::Io(std::io::Error::other("child stderr missing")))?;
 
-        let mut stdout_lines = BufReader::new(stdout).lines();
-        let mut stderr_lines = BufReader::new(stderr).lines();
+        // Detached, not awaited as part of build completion: `child.wait()`
+        // below is the only reliable "the build process itself is done"
+        // signal. A grandchild the compiler spawns and that outlives cargo
+        // (e.g. an `RUSTC_WRAPPER` compiler-cache daemon such as sccache,
+        // which auto-starts a persistent server that inherits these same
+        // piped fds) can keep a pipe's write end open long after `cargo`
+        // itself exits -- waiting for both pipes to reach EOF before ever
+        // calling `child.wait()` (the previous design here) would then hang
+        // for the full build timeout even though the build already finished.
+        // Mirrors `runtime::process::ProcessDriver`'s own log-draining,
+        // which is likewise fire-and-forget rather than part of the
+        // spawn/exit critical path.
+        tokio::spawn(drain_build_output_to_log(stdout, stderr, log_file));
 
-        // Interleave stdout/stderr into the log file in the order lines
-        // arrive, flushing after each write so a concurrent `follow` of the
-        // log file (a later admin-api task) sees progress live instead of a
-        // buffered dump at the end.
-        let wait_result = tokio::time::timeout(request.timeout, async {
-            let mut stdout_done = false;
-            let mut stderr_done = false;
-            loop {
-                tokio::select! {
-                    line = stdout_lines.next_line(), if !stdout_done => {
-                        match line {
-                            Ok(Some(l)) => {
-                                log_file.write_all(l.as_bytes()).await?;
-                                log_file.write_all(b"\n").await?;
-                                log_file.flush().await?;
-                            }
-                            Ok(None) => stdout_done = true,
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    line = stderr_lines.next_line(), if !stderr_done => {
-                        match line {
-                            Ok(Some(l)) => {
-                                log_file.write_all(l.as_bytes()).await?;
-                                log_file.write_all(b"\n").await?;
-                                log_file.flush().await?;
-                            }
-                            Ok(None) => stderr_done = true,
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    else => break,
-                }
-                if stdout_done && stderr_done {
-                    break;
-                }
-            }
-            child.wait().await
-        })
-        .await;
+        let wait_result = tokio::time::timeout(request.timeout, child.wait()).await;
 
         let status = match wait_result {
             Ok(Ok(status)) => status,
@@ -154,4 +126,49 @@ impl Builder for HostCargoBuilder {
 
         Ok(())
     }
+}
+
+/// Interleaves `stdout`/`stderr` into `log_file` in the order lines arrive,
+/// flushing after each write so a concurrent `follow` of the log file (T081)
+/// sees progress live rather than a buffered dump at the end. Runs until
+/// both streams reach EOF -- which, per the caller's own doc comment, may
+/// never happen if a grandchild process outlives `cargo` holding a pipe
+/// open; that's fine here since this task is detached and not on the
+/// build's own completion path. Write errors are swallowed (best-effort
+/// logging must never be why an otherwise-successful build fails).
+async fn drain_build_output_to_log(
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    mut log_file: tokio::fs::File,
+) {
+    let mut stdout_lines = BufReader::new(stdout).lines();
+    let mut stderr_lines = BufReader::new(stderr).lines();
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    loop {
+        tokio::select! {
+            line = stdout_lines.next_line(), if !stdout_done => {
+                match line {
+                    Ok(Some(l)) => write_log_line(&mut log_file, &l).await,
+                    Ok(None) | Err(_) => stdout_done = true,
+                }
+            }
+            line = stderr_lines.next_line(), if !stderr_done => {
+                match line {
+                    Ok(Some(l)) => write_log_line(&mut log_file, &l).await,
+                    Ok(None) | Err(_) => stderr_done = true,
+                }
+            }
+            else => break,
+        }
+        if stdout_done && stderr_done {
+            break;
+        }
+    }
+}
+
+async fn write_log_line(log_file: &mut tokio::fs::File, line: &str) {
+    let _ = log_file.write_all(line.as_bytes()).await;
+    let _ = log_file.write_all(b"\n").await;
+    let _ = log_file.flush().await;
 }
