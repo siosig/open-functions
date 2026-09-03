@@ -334,3 +334,71 @@ async fn a_failed_redeploy_build_keeps_the_previous_revision_ready_and_records_l
         "a failed redeploy must record last_error"
     );
 }
+
+// ---- T041 (002-python-runtime, US3): image-mode doesn't validate runtime ----
+
+/// `register_image` talks to a real Docker daemon (`resolve_image_digest`
+/// bypasses the `Driver` abstraction entirely -- it constructs its own
+/// `bollard::Docker` client from `docker_socket`), so this needs
+/// `OPEN_FUNCTIONS_TEST_DOCKER=1`, matching this workspace's
+/// opt-in-external-dependency convention.
+macro_rules! require_docker_test {
+    () => {
+        if std::env::var("OPEN_FUNCTIONS_TEST_DOCKER").is_err() {
+            eprintln!(
+                "skipping {}: set OPEN_FUNCTIONS_TEST_DOCKER=1 to run (needs a real Docker daemon)",
+                module_path!()
+            );
+            return;
+        }
+    };
+}
+
+fn image_register_request(
+    name: &str,
+    image_ref: &str,
+    runtime: Option<Runtime>,
+) -> RegisterRequest {
+    RegisterRequest {
+        name: name.to_string(),
+        trigger: Trigger::Http,
+        source: Source::Image {
+            image_ref: image_ref.to_string(),
+        },
+        runtime,
+        entry_point: Some("not-a-python-identifier".to_string()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn image_mode_accepts_either_declared_runtime_and_persists_it_unvalidated() {
+    require_docker_test!();
+    let registry = registry_with(true, vec![]);
+
+    for runtime in [Runtime::Rust, Runtime::Python314] {
+        let name = format!("image-fn-{}", runtime.label());
+        let accepted = registry
+            .register(image_register_request(
+                &name,
+                "python:3.14-slim",
+                Some(runtime),
+            ))
+            .await
+            .unwrap_or_else(|err| {
+                panic!("image-mode registration with runtime = {runtime:?} should be accepted (not validated): {err:?}")
+            });
+        assert_eq!(accepted.build_id, "", "image-mode has no build step");
+
+        let function = registry
+            .get(&name)
+            .expect("get")
+            .expect("function should exist");
+        assert_eq!(
+            function.runtime,
+            Some(runtime),
+            "the declared runtime must be persisted as-is on Function.runtime"
+        );
+        assert_eq!(function.state, FunctionState::Ready);
+    }
+}

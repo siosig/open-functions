@@ -53,6 +53,12 @@ Environment variables:
                      $CARGO_TARGET_DIR/release/open-functions if CARGO_TARGET_DIR is
                      set, else <repo_root>/target/release/open-functions. Built via
                      `cargo build --release -p open-functions` first if missing.
+  FN_NAME            Function name to deploy (default "hello").
+  SOURCE_DIR         Source directory to deploy (default
+                     <repo_root>/examples/hello-http). Set to
+                     examples/hello-python-http (with ENTRY_POINT=hello) to
+                     exercise a Python host-mode function instead.
+  ENTRY_POINT        entry_point to deploy with (default "hello").
   ADMIN_PORT         Admin API port to bind (default 18081).
   INVOKE_PORT         Invoke listener port to bind (default 18080).
   DEPLOY_TIMEOUT_SECS  Seconds to wait for the initial deploy to reach
@@ -62,6 +68,12 @@ Environment variables:
                        (default 30).
   SHUTDOWN_TIMEOUT_SECS  Seconds to wait for the process to exit after
                          SIGTERM (default 45).
+
+The on-disk artifact hashed to prove "no rebuild occurred" differs by
+runtime, auto-detected from what's actually on disk: a Rust function hashes
+its single `function` executable; a Python function (no `function` file,
+built as `src/` + `venv/` instead) hashes `src/main.py` and
+`venv/bin/functions-framework` together.
 
 Exit codes:
   0  all N restarts completed with every invariant intact
@@ -110,8 +122,9 @@ if [[ ! -x "$OPEN_FUNCTIONS_BIN" ]]; then
 fi
 log "Using open-functions binary: $OPEN_FUNCTIONS_BIN"
 
-HELLO_HTTP_DIR="$REPO_ROOT/examples/hello-http"
-[[ -d "$HELLO_HTTP_DIR" ]] || fail "examples/hello-http not found at $HELLO_HTTP_DIR"
+SOURCE_DIR="${SOURCE_DIR:-$REPO_ROOT/examples/hello-http}"
+[[ -d "$SOURCE_DIR" ]] || fail "SOURCE_DIR not found at $SOURCE_DIR"
+ENTRY_POINT="${ENTRY_POINT:-hello}"
 
 ADMIN_PORT="${ADMIN_PORT:-18081}"
 INVOKE_PORT="${INVOKE_PORT:-18080}"
@@ -119,7 +132,7 @@ DEPLOY_TIMEOUT_SECS="${DEPLOY_TIMEOUT_SECS:-600}"
 READY_TIMEOUT_SECS="${READY_TIMEOUT_SECS:-30}"
 SHUTDOWN_TIMEOUT_SECS="${SHUTDOWN_TIMEOUT_SECS:-45}"
 CURL_TIMEOUT="${DEPLOY_TIMEOUT_SECS}"
-FN_NAME="hello"
+FN_NAME="${FN_NAME:-hello}"
 ADMIN_URL="http://127.0.0.1:${ADMIN_PORT}"
 INVOKE_URL="http://127.0.0.1:${INVOKE_PORT}"
 
@@ -284,9 +297,25 @@ get_current_revision() {
 
 get_artifact_hash() {
   local revision="$1"
-  local path="$DATA_DIR/artifacts/$FN_NAME/$revision/function"
-  [[ -f "$path" ]] || fail "expected build artifact at $path but it does not exist"
-  sha256sum "$path" | awk '{print $1}'
+  local rev_dir="$DATA_DIR/artifacts/$FN_NAME/$revision"
+  local rust_bin="$rev_dir/function"
+  if [[ -f "$rust_bin" ]]; then
+    sha256sum "$rust_bin" | awk '{print $1}'
+    return
+  fi
+  # Python (host-mode): no single `function` file -- built as `src/` +
+  # `venv/` instead. Hash `src/main.py` (the source snapshot) and
+  # `venv/bin/functions-framework` (the resolved dependency) together, so
+  # either a source change or a dependency-resolution change would be
+  # caught, exactly like the single-file Rust hash above.
+  local py_main="$rev_dir/src/main.py"
+  local py_ff="$rev_dir/venv/bin/functions-framework"
+  [[ -f "$py_main" ]] || fail "expected a build artifact at $rust_bin or $py_main but neither exists"
+  [[ -e "$py_ff" ]] || fail "expected $py_ff (venv functions-framework) to exist"
+  local main_hash ff_hash
+  main_hash=$(sha256sum "$py_main" | awk '{print $1}')
+  ff_hash=$(sha256sum "$py_ff" | awk '{print $1}')
+  printf '%s %s' "$main_hash" "$ff_hash" | sha256sum | awk '{print $1}'
 }
 
 log "Starting open-functions serve: data-dir=$DATA_DIR invoke=$INVOKE_URL admin=$ADMIN_URL"
@@ -295,9 +324,9 @@ wait_for_ready "$READY_TIMEOUT_SECS" \
   || fail "open-functions serve (pid $SERVE_PID) did not become ready within ${READY_TIMEOUT_SECS}s on initial start. Log: $DATA_DIR/serve.log"
 log "open-functions serve is ready (pid $SERVE_PID)"
 
-log "Deploying $FN_NAME from $HELLO_HTTP_DIR (source-mode; this triggers a real cold build and may take a few minutes)"
-DEPLOY_BODY=$(jq -n --arg path "$HELLO_HTTP_DIR" \
-  '{trigger: {type: "http"}, source: {kind: "dir", path: $path}, entry_point: "hello"}')
+log "Deploying $FN_NAME from $SOURCE_DIR (source-mode; this triggers a real cold build and may take a few minutes)"
+DEPLOY_BODY=$(jq -n --arg path "$SOURCE_DIR" --arg entry "$ENTRY_POINT" \
+  '{trigger: {type: "http"}, source: {kind: "dir", path: $path}, entry_point: $entry}')
 http_call PUT "$ADMIN_URL/v1/functions/$FN_NAME" "$DEPLOY_BODY"
 expect_status "$HTTP_STATUS" 202 "PUT /v1/functions/$FN_NAME" "$HTTP_BODY"
 

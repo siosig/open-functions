@@ -43,6 +43,16 @@ systemd mode:
   host.
 - HTTPS reachability to GitHub Releases (for downloading the `open-functions`
   binary and its checksum file).
+- Python functions (002-python-runtime): `open_functions_python_mode` defaults
+  to `auto` (falls back to `container` if no system `python3.14` is found)
+  under systemd, and is always forced to `container` under docker mode (the
+  distributed image has no Python/uv of its own -- see `docker/Dockerfile`).
+  `python.mode = container` -- explicit or fallen-back-to -- requires
+  `open_functions_enable_docker: true`, same as `build.mode = container`; the
+  role's `preflight` tag rejects the combination otherwise. Set
+  `open_functions_extra_env` for proxy/index vars (`UV_*`/`PIP_*`/
+  `HTTP_PROXY`/etc.) `uv`/`pip` need but this role has no dedicated variable
+  for -- see `contracts/ops-config.md`'s 002 delta.
 
 Docker mode:
 

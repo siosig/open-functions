@@ -11,6 +11,7 @@
 //! [`snapshot`], and [`env`] (steps 1-2 are always run on the host, even for
 //! container-mode, per the contract's step 5).
 
+pub mod container;
 pub mod env;
 pub mod host;
 pub mod requirements;

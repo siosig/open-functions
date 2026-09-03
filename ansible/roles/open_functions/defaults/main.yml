@@ -37,8 +37,32 @@ open_functions_build_mode: "{{ 'auto' if open_functions_deploy_mode == 'systemd'
 # When true: the systemd unit gets SupplementaryGroups=docker, and the
 # docker-mode container gets the docker socket bind-mounted plus
 # --group-add <docker gid>. Needed only if functions are registered in
-# build.mode = container / build.mode = auto falling back to container.
+# build.mode = container / build.mode = auto falling back to container, or
+# python.mode = container / python.mode = auto falling back to container
+# (below).
 open_functions_enable_docker: false
+
+# --- Python (002-python-runtime) ---------------------------------------------
+
+# "auto" | "host" | "container". docker deploy mode always needs "container"
+# (the distributed open-functions image has no Python/uv - see
+# docker/Dockerfile's header comment); systemd mode defaults to "auto"
+# (falls back to host if a system python3.14 happens to be present, else
+# container - either way requires open_functions_enable_docker: true unless
+# python.mode is pinned to "host" and 3.14 really is on the host's PATH).
+open_functions_python_mode: "{{ 'container' if open_functions_deploy_mode == 'docker' else 'auto' }}"
+open_functions_python_installer: auto
+open_functions_python_bin: ""
+open_functions_python_container_image: "ghcr.io/astral-sh/uv:python3.14-trixie-slim"
+open_functions_python_functions_framework: "functions-framework==3.10.2"
+
+# Arbitrary extra environment variables passed through to the open-functions
+# process itself (systemd unit `Environment=`, or the docker container's own
+# env) - primarily for the uv/pip passthrough env vars
+# (contracts/ops-config.md's 002 delta: UV_*/PIP_*/HTTP_PROXY/HTTPS_PROXY/
+# NO_PROXY/SSL_CERT_FILE/SSL_CERT_DIR/NETRC), since open-functions reads those
+# from its own process environment rather than a config key.
+open_functions_extra_env: {}
 
 # docker mode only: source directories bind-mounted read-only into the
 # container at the same path, so source-mode function registrations can

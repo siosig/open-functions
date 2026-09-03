@@ -20,6 +20,9 @@ Group={{ open_functions_system_group }}
 {% if open_functions_enable_docker %}
 SupplementaryGroups=docker
 {% endif %}
+{% for key, value in open_functions_extra_env.items() %}
+Environment={{ key }}={{ value }}
+{% endfor %}
 StateDirectory={{ open_functions_service_name }}
 # Without an explicit mode, systemd defaults StateDirectoryMode to 0755 and
 # re-applies it to the state directory every time this unit starts,

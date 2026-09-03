@@ -139,6 +139,7 @@ fn base_spec() -> InstanceSpec {
         memory_mib: 128,
         start_timeout: Duration::from_secs(30),
         launch: open_functions_core::runtime::Launch::image(ensure_test_image().to_string()),
+        runtime_label: open_functions_core::model::runtime::RuntimeLabel::Image,
     }
 }
 
@@ -342,6 +343,7 @@ async fn spawn_honors_launch_container_binds_cmd_and_working_dir() {
             ]),
             working_dir: Some("/srv".to_string()),
         },
+        runtime_label: open_functions_core::model::runtime::RuntimeLabel::Image,
     };
 
     let handle = driver

@@ -196,6 +196,16 @@ async fn create_venv_and_install(
                 .arg(python_bin)
                 .arg("--no-python-downloads")
                 .arg("--no-managed-python")
+                // A revision's artifact dir is only allocated a new number on a
+                // *successful* build (`existing.current_revision + 1`, reused
+                // across repeated failures at the same number -- see
+                // service.rs's `register_source_python`), so a retry after any
+                // failed attempt targets the same `venv_dir`. Without `--clear`,
+                // uv refuses to create a venv over one that already exists
+                // (even a partial one from the failed attempt), so the retry
+                // fails on this step regardless of whether the actual problem
+                // was fixed.
+                .arg("--clear")
                 .envs(env);
             if !run_logged(log, "venv (uv)", venv_cmd, remaining(deadline)?).await? {
                 return Err(PythonBuildError::VenvFailed(log_path.to_path_buf()));
@@ -217,7 +227,12 @@ async fn create_venv_and_install(
         }
         Tool::Pip => {
             let mut venv_cmd = Command::new(python_bin);
-            venv_cmd.arg("-m").arg("venv").arg(venv_dir).envs(env);
+            venv_cmd
+                .arg("-m")
+                .arg("venv")
+                .arg("--clear") // see the uv branch above for why this is needed on a retry
+                .arg(venv_dir)
+                .envs(env);
             if !run_logged(log, "venv (pip)", venv_cmd, remaining(deadline)?).await? {
                 return Err(PythonBuildError::VenvFailed(log_path.to_path_buf()));
             }

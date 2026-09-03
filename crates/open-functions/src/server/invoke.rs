@@ -21,7 +21,8 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Json};
 use cloudevents::AttributesReader;
 use open_functions_core::forward::{ForwardFailure, RequestRewriteContext, map_outcome};
-use open_functions_core::model::function::FunctionState;
+use open_functions_core::model::function::{FunctionState, Source};
+use open_functions_core::model::runtime::RuntimeLabel;
 use open_functions_core::pool::AcquireError;
 use open_functions_core::pubsub::convert::{
     CloudEventParams, PushConvertError, parse_push_envelope, to_cloud_event,
@@ -93,9 +94,13 @@ async fn handle(
                 .into_response();
         }
     };
+    let runtime_label = RuntimeLabel::from_declared(
+        record.runtime,
+        matches!(&record.source, Source::Image { .. }),
+    );
 
     if record.current_revision.is_none() || record.state != FunctionState::Ready {
-        record_invocation(&function, "http", "rejected", 503, None);
+        record_invocation(&function, runtime_label, "http", "rejected", 503, None);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
@@ -108,7 +113,7 @@ async fn handle(
     }
 
     let Some(pool) = state.registry.pool_for(&function).await else {
-        record_invocation(&function, "http", "rejected", 503, None);
+        record_invocation(&function, runtime_label, "http", "rejected", 503, None);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "function not ready", "code": "UNAVAILABLE"})),
@@ -119,15 +124,15 @@ async fn handle(
     let acquired = match pool.acquire().await {
         Ok(acquired) => acquired,
         Err(AcquireError::Rejected) => {
-            record_invocation(&function, "http", "rejected", 429, None);
+            record_invocation(&function, runtime_label, "http", "rejected", 429, None);
             return queue_rejected();
         }
         Err(AcquireError::QueueTimeout(_)) => {
-            record_invocation(&function, "http", "rejected", 429, None);
+            record_invocation(&function, runtime_label, "http", "rejected", 429, None);
             return queue_rejected();
         }
         Err(AcquireError::Draining) => {
-            record_invocation(&function, "http", "rejected", 503, None);
+            record_invocation(&function, runtime_label, "http", "rejected", 503, None);
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 [(header::CONNECTION, "close")],
@@ -136,7 +141,7 @@ async fn handle(
                 .into_response();
         }
         Err(AcquireError::Spawn(err)) => {
-            record_invocation(&function, "http", "error", 502, None);
+            record_invocation(&function, runtime_label, "http", "error", 502, None);
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": err.to_string(), "code": "UNAVAILABLE"})),
@@ -169,6 +174,7 @@ async fn handle(
         Ok(resp) => {
             record_invocation(
                 &function,
+                runtime_label,
                 "http",
                 "ok",
                 resp.status().as_u16(),
@@ -186,6 +192,7 @@ async fn handle(
             let mapping = map_outcome(failure);
             record_invocation(
                 &function,
+                runtime_label,
                 "http",
                 forward_failure_outcome(failure),
                 mapping.status,
@@ -222,6 +229,7 @@ fn forward_failure_outcome(failure: ForwardFailure) -> &'static str {
 /// `outcome`), per ops-config.md's metrics and logging tables.
 fn record_invocation(
     function: &str,
+    runtime_label: RuntimeLabel,
     kind: &'static str,
     outcome: &'static str,
     status: u16,
@@ -232,6 +240,7 @@ fn record_invocation(
         "function" => function.to_string(),
         "kind" => kind,
         "outcome" => outcome,
+        "runtime" => runtime_label.as_str(),
     )
     .increment(1);
     if let Some(duration) = duration {
@@ -239,6 +248,7 @@ fn record_invocation(
             "open_functions_invocation_duration_seconds",
             "function" => function.to_string(),
             "kind" => kind,
+            "runtime" => runtime_label.as_str(),
         )
         .record(duration.as_secs_f64());
     }
@@ -299,6 +309,10 @@ async fn handle_push(
             return internal_error(&err.to_string());
         }
     };
+    let runtime_label = RuntimeLabel::from_declared(
+        record.runtime,
+        matches!(&record.source, Source::Image { .. }),
+    );
 
     let topic = match &record.trigger {
         open_functions_core::model::function::Trigger::Pubsub { topic } => topic.clone(),
@@ -312,7 +326,7 @@ async fn handle_push(
 
     if record.current_revision.is_none() || record.state != FunctionState::Ready {
         record_push_received(&function, "nack");
-        record_invocation(&function, "event", "rejected", 503, None);
+        record_invocation(&function, runtime_label, "event", "rejected", 503, None);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "function not ready", "code": "UNAVAILABLE", "state": record.state})),
@@ -321,7 +335,7 @@ async fn handle_push(
     }
     let Some(pool) = state.registry.pool_for(&function).await else {
         record_push_received(&function, "nack");
-        record_invocation(&function, "event", "rejected", 503, None);
+        record_invocation(&function, runtime_label, "event", "rejected", 503, None);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "function not ready", "code": "UNAVAILABLE"})),
@@ -333,17 +347,17 @@ async fn handle_push(
         Ok(acquired) => acquired,
         Err(AcquireError::Rejected | AcquireError::QueueTimeout(_)) => {
             record_push_received(&function, "nack");
-            record_invocation(&function, "event", "rejected", 429, None);
+            record_invocation(&function, runtime_label, "event", "rejected", 429, None);
             return status_only(429);
         }
         Err(AcquireError::Draining) => {
             record_push_received(&function, "nack");
-            record_invocation(&function, "event", "rejected", 503, None);
+            record_invocation(&function, runtime_label, "event", "rejected", 503, None);
             return status_only(503);
         }
         Err(AcquireError::Spawn(_)) => {
             record_push_received(&function, "nack");
-            record_invocation(&function, "event", "error", 503, None);
+            record_invocation(&function, runtime_label, "event", "error", 503, None);
             return status_only(503);
         }
     };
@@ -359,7 +373,7 @@ async fn handle_push(
         Ok(req) => req,
         Err(_) => {
             record_push_received(&function, "nack");
-            record_invocation(&function, "event", "error", 500, None);
+            record_invocation(&function, runtime_label, "event", "error", 500, None);
             return internal_error("failed to build CloudEvent request");
         }
     };
@@ -383,7 +397,7 @@ async fn handle_push(
     match outcome {
         Ok(resp) if resp.status().is_success() => {
             record_push_received(&function, "ack");
-            record_invocation(&function, "event", "ok", 204, duration);
+            record_invocation(&function, runtime_label, "event", "ok", 204, duration);
             status_only(204)
         }
         Ok(resp) => {
@@ -391,7 +405,14 @@ async fn handle_push(
             // instance's own status (Nack -> open-pubusb retries).
             record_push_received(&function, "nack");
             let status = resp.status();
-            record_invocation(&function, "event", "ok", status.as_u16(), duration);
+            record_invocation(
+                &function,
+                runtime_label,
+                "event",
+                "ok",
+                status.as_u16(),
+                duration,
+            );
             status_only(status.as_u16())
         }
         Err(failure) => {
@@ -405,6 +426,7 @@ async fn handle_push(
             let mapping = map_outcome(failure);
             record_invocation(
                 &function,
+                runtime_label,
                 "event",
                 forward_failure_outcome(failure),
                 mapping.status,

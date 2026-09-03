@@ -7,6 +7,7 @@
 - [Overview](#overview)
 - [Quickstart](#quickstart)
 - [Writing a function](#writing-a-function)
+- [Python 3.14 functions](#python-314-functions)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [URL scheme](#url-scheme)
@@ -53,6 +54,78 @@ See [`crates/open-functions-sdk/README.md`](crates/open-functions-sdk/README.md)
 for complete worked examples (HTTP and CloudEvent/Pub-Sub functions),
 structured logging, and the exact steps to deploy the same source unmodified
 to real Cloud Run functions.
+
+## Python 3.14 functions
+
+Alongside Rust, `open-functions` builds and runs Python 3.14 functions
+written against the official
+[`functions-framework`](https://pypi.org/project/functions-framework/)
+(the same one Cloud Run functions itself uses — no `open-functions`-specific
+SDK to import):
+
+```python
+import functions_framework
+
+@functions_framework.http
+def hello(request):
+    return "Hello from Python!"
+```
+
+```bash
+open-functions fn deploy hello-py --source ./examples/hello-python-http \
+  --entry-point hello --runtime python314
+```
+
+`--runtime python314` (or a `requirements.txt`/`pyproject.toml` in
+`--source`, which is auto-detected) picks the Python build pipeline over
+the Rust one; `open-functions fn deploy` then resolves the function's
+dependencies with `uv` (preferred) or `pip`, exactly like `cargo build
+--release` does for a Rust function.
+
+**`python.mode`** (`auto` | `host` | `container`, default `auto`) picks
+where dependency resolution runs:
+
+| Mode | Behavior |
+|---|---|
+| `auto` | Prefer a host `python3.14` interpreter on `PATH`; fall back to a container build if none is found; reject with `412 FAILED_PRECONDITION` if neither is available |
+| `host` | Always build with the host interpreter; reject with 412 if none is found |
+| `container` | Always build inside `python.container_image` via the Docker socket; reject with 412 if Docker isn't reachable |
+
+`python.python_bin` overrides interpreter autodetection (empty = search
+`python3.14` → `python3` → `python` on `PATH`, first 3.14.x match).
+`python.installer` (`auto` | `uv` | `pip`, default `auto`) picks the
+dependency-installer tool the same way — `auto` prefers `uv` when it's
+usable, falling back to the interpreter's own `venv` + `pip`. The
+distributed Docker image always resolves to `python.mode = container` (see
+`docker/config.toml`) since its distroless runtime has no Python/uv of its
+own.
+
+### Troubleshooting
+
+- **`412 FAILED_PRECONDITION` deploying a Python function**: no usable
+  Python 3.14 interpreter (`host`/`auto`) or no reachable Docker daemon
+  (`container`/`auto`) was found; the error body's `details.needed` lists
+  which. Install Python 3.14 (or `uv`) on the host, or point `python.mode`
+  at whichever pipeline is actually available.
+- **`PIP_INDEX_URL` / other `PIP_*` variables have no effect**: `uv`
+  deliberately doesn't read pip's configuration (`pip.conf`, `PIP_*`) — this
+  is a documented uv design choice, not an open-functions limitation. When
+  `installer` resolves to `uv` (the `auto` default whenever `uv` is
+  usable), use `uv`'s own variables instead: `UV_DEFAULT_INDEX`, `UV_INDEX`,
+  `UV_EXTRA_INDEX_URL`, plus the standard `HTTP_PROXY`/`HTTPS_PROXY`/
+  `NO_PROXY`/`SSL_CERT_FILE`/`SSL_CERT_DIR`/`NETRC`, which both `uv` and
+  `pip` read. Set them in the process environment `open-functions` itself
+  runs in (systemd unit `Environment=`/`EnvironmentFile=`, or the Docker
+  container's env — see `ansible/`'s `open_functions_extra_env` for the
+  Ansible-managed equivalent); they are never passed through to a
+  function's own runtime environment.
+- **A dependency with native extensions fails to build**: host-mode
+  resolution needs a C toolchain for source builds; container-mode's
+  `python.container_image` (`ghcr.io/astral-sh/uv:python3.14-trixie-slim`
+  by default) doesn't ship one either. Prefer dependencies that publish
+  prebuilt wheels for `cp314`/`manylinux`, or point `python.container_image`
+  at a custom image that includes the compiler toolchain the dependency
+  needs.
 
 ## Installation
 
@@ -159,14 +232,33 @@ open-functions fn build-log <name> [--build <id>] [--follow]
 open-functions fn stop <name>
 ```
 
-`--source` builds from a local directory (host `cargo` or a containerized
-build, per `build.mode`); `--image` runs a pre-built container image
-directly, requiring a reachable Docker daemon. `deploy` follows the build to
-completion by default; pass `--no-wait` to return as soon as it's accepted.
-Output is a table on a TTY and JSON otherwise (or force either with
-`--output json|table`). `OPEN_FUNCTIONS_ADMIN_URL` (default
-`http://127.0.0.1:8081`) and `OPEN_FUNCTIONS_ADMIN_TOKEN` configure which
-admin API these commands talk to.
+`--source` builds from a local directory (host `cargo`/`uv`/`pip` or a
+containerized build, per `build.mode`/`python.mode`); `--image` runs a
+pre-built container image directly, requiring a reachable Docker daemon.
+`deploy` follows the build to completion by default; pass `--no-wait` to
+return as soon as it's accepted. Output is a table on a TTY and JSON
+otherwise (or force either with `--output json|table`).
+`OPEN_FUNCTIONS_ADMIN_URL` (default `http://127.0.0.1:8081`) and
+`OPEN_FUNCTIONS_ADMIN_TOKEN` configure which admin API these commands talk
+to.
+
+A Python function's Dockerfile (see
+[`examples/hello-python-http/Dockerfile`](examples/hello-python-http/Dockerfile))
+is the *same* image Cloud Run functions' `--base-image python314` /
+container-source deploy uses, so `--image` here and a real GCP deploy from
+that image behave identically -- there's nothing open-functions-specific baked
+into it:
+
+```bash
+docker build -t hello-python-http:dev examples/hello-python-http
+open-functions fn deploy hello-py-img --image hello-python-http:dev \
+  --entry-point hello --runtime python314
+```
+
+`--runtime` is stored as a display-only hint for image-mode (`fn list`'s
+`RUNTIME` column, `fn describe`'s `runtime` field) -- open-functions never
+inspects or builds the image, so an image-mode registration accepts any
+declared runtime (or none, reported as `null`) without validating it.
 
 ## Pub/Sub integration
 
@@ -177,6 +269,34 @@ delivery into a `google.cloud.pubsub.topic.v1.messagePublished` CloudEvent
 before forwarding it to the function, and acks or lets the delivery retry
 based on the function's response — identical to how Eventarc delivers
 Pub/Sub events to a real Cloud Run function.
+
+A Python function receives the same event via the official
+`functions_framework.cloud_event` decorator (see
+[`examples/hello-python-pubsub`](examples/hello-python-pubsub)):
+
+```bash
+open-functions fn deploy on-orders-py \
+  --source ./examples/hello-python-pubsub \
+  --entry-point on_msg \
+  --trigger-topic orders-py
+```
+
+```python
+import base64
+import functions_framework
+
+@functions_framework.cloud_event
+def on_msg(cloud_event):
+    message = cloud_event.data["message"]
+    text = base64.b64decode(message["data"]).decode("utf-8")
+    print(f"received: {text}")
+```
+
+`cloud_event.data` is GCP's `MessagePublishedData` shape: `message.data` is
+base64-encoded (decode it yourself, as above), `message.attributes` is a
+plain dict, and `cloud_event["type"]` / `cloud_event["source"]` carry the
+CloudEvent envelope's own type/source, unchanged from the Rust SDK's
+`CloudEvent` — the same contract either language sees.
 
 ## Observability
 

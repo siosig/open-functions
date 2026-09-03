@@ -388,3 +388,92 @@ async fn min_instances_are_prewarmed_on_restore() {
         "restore should have pre-warmed min_instances=2"
     );
 }
+
+// ---- T045 (002-python-runtime, US4) ----
+
+fn python314_available() -> bool {
+    std::process::Command::new("python3.14")
+        .args(["-c", "import sys; print(sys.version_info[:2])"])
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "(3, 14)")
+        .unwrap_or(false)
+}
+
+macro_rules! require_python314 {
+    () => {
+        if !python314_available() {
+            eprintln!("skipping {}: python3.14 not found on PATH", module_path!());
+            return;
+        }
+    };
+}
+
+fn hello_python_http_dir() -> PathBuf {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .join("../../examples/hello-python-http")
+        .canonicalize()
+        .expect("examples/hello-python-http should exist relative to open-functions-core")
+}
+
+/// A Python function's revision (`build_mode = host`) must be restored via
+/// `Launch::python_host`, exactly as `activate_revision` would build it for
+/// a fresh registration -- `restore_ready_function_pools` calls the very
+/// same `activate_revision`, so this is really confirming no Rust-only
+/// assumption snuck into that shared path, proven end-to-end with a real
+/// build + a real post-restore invocation (not just "a pool object exists").
+#[tokio::test]
+async fn python_function_revision_is_restored_via_launch_python_host_and_actually_serves() {
+    require_python314!();
+    let data_dir = tempfile::tempdir().expect("tempdir");
+
+    let (registry, store) = new_registry(data_dir.path());
+    let req = open_functions_core::registry::service::RegisterRequest {
+        name: "hello-py-restore".to_string(),
+        trigger: Trigger::Http,
+        source: Source::Dir {
+            path: hello_python_http_dir().to_string_lossy().to_string(),
+            bin: None,
+        },
+        runtime: None,
+        entry_point: Some("hello".to_string()),
+        ..Default::default()
+    };
+    registry
+        .register(req)
+        .await
+        .expect("registering examples/hello-python-http should succeed");
+    let function = registry
+        .get("hello-py-restore")
+        .expect("get")
+        .expect("function should exist");
+    assert_eq!(function.state, FunctionState::Ready);
+    drop(registry);
+    drop(store);
+
+    // A fresh `RegistryService` against the same `data_dir`, simulating a
+    // process restart: `pools` always starts empty (T060's own design), so
+    // whatever comes back from `pool_for` below only exists because
+    // `restore()` rebuilt it from the persisted `Revision`.
+    let (restored_registry, _store2) = new_registry(data_dir.path());
+    let report = restored_registry.restore().await.expect("restore");
+    assert!(report.broken_functions.is_empty());
+
+    let pool = restored_registry
+        .pool_for("hello-py-restore")
+        .await
+        .expect("pool should have been recreated by restore()");
+    let acquired = pool
+        .acquire()
+        .await
+        .expect("acquire should spawn a fresh Launch::python_host instance");
+    let resp = reqwest::get(format!("http://{}/x?y=1", acquired.addr))
+        .await
+        .expect("HTTP GET to the restored instance should succeed");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.text().await.expect("body");
+    assert_eq!(
+        body, "Hello /x?y=1",
+        "the restored instance must actually be running via Launch::python_host"
+    );
+}

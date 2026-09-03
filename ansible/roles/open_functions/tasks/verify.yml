@@ -62,6 +62,7 @@
     # `networks: strict` in the `comparisons` option."
     published_ports: "{{ open_functions_published_ports }}"
     volumes: "{{ open_functions_container_volumes }}"
+    env: "{{ open_functions_extra_env if open_functions_extra_env | length > 0 else omit }}"
     groups: "{{ [open_functions_docker_socket_stat.stat.gid | string] if open_functions_enable_docker else omit }}"
     comparisons:
       '*': strict

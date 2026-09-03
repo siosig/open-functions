@@ -142,6 +142,13 @@ provisioner:
         open_functions_version: "0.1.0"
         open_functions_image: open-functions-molecule
         open_functions_image_tag: "0.1.0"
+        # 002-python-runtime: docker deploy mode always resolves
+        # open_functions_python_mode to "container" (defaults/main.yml), which
+        # tasks/preflight.yml requires open_functions_enable_docker: true for
+        # (a reachable Docker daemon to resolve Python dependencies in) -
+        # this instance is therefore also this scenario's python.mode =
+        # container coverage, not just build.mode = container's.
+        open_functions_enable_docker: true
         # docker mode's internal admin.listen is always 0.0.0.0 (see
         # vars/main.yml's open_functions_config_admin_listen), which open-functions's own
         # config schema treats as non-loopback regardless of

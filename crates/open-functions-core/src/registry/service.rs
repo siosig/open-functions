@@ -36,7 +36,7 @@ use crate::model::function::{
     Function, FunctionState, QueuePolicy as ModelQueuePolicy, Source, Trigger,
 };
 use crate::model::revision::Revision;
-use crate::model::runtime::{Runtime, detect_runtime};
+use crate::model::runtime::{Runtime, RuntimeLabel, detect_runtime};
 use crate::model::validate::{self, ValidationError};
 use crate::pool::{InstancePool, PoolConfig, QueuePolicy as PoolQueuePolicy};
 use crate::pubsub::reconcile::{DesiredBinding, Reconciler};
@@ -64,9 +64,9 @@ pub enum BuildModeSetting {
 /// shape for the Rust pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PythonModeSetting {
-    /// Prefer `host_builder`; fall back to `container_builder` (once T034/T035
-    /// wire one in) if no usable Python 3.14 interpreter is found; reject
-    /// with 412 if neither is available.
+    /// Prefer `host_builder`; fall back to `container_builder` if no usable
+    /// Python 3.14 interpreter is found; reject with 412 if neither is
+    /// available.
     Auto,
     /// Always `host_builder`; reject with 412 if no usable Python 3.14
     /// interpreter is found.
@@ -85,9 +85,11 @@ pub enum PythonModeSetting {
 pub struct PythonSettings {
     pub mode: PythonModeSetting,
     pub host_builder: Arc<dyn PythonBuilder>,
-    /// `None` until a `ContainerPythonBuilder` is wired in (T034/T035) --
+    /// `None` when the Docker client couldn't be constructed at startup --
     /// `python.mode = container`/`auto` then behave as if no container
-    /// builder is configured at all.
+    /// builder is configured at all (the caller, `serve.rs`, always tries
+    /// to build one; construction is cheap/infallible for a well-formed
+    /// socket path, so this is effectively always `Some` in practice).
     pub container_builder: Option<Arc<dyn PythonBuilder>>,
     pub installer: PythonInstaller,
     /// `python.python_bin`; empty means autodetect (`HostPythonBuilder`'s
@@ -587,9 +589,7 @@ impl RegistryService {
 
     /// Picks the `PythonBuilder` for a Python source-mode registration per
     /// `python.mode`, mirroring `select_source_builder`'s shape for the Rust
-    /// pipeline. `Container` currently always fails (`container_builder` is
-    /// `None` until T034/T035 wire a `ContainerPythonBuilder` in); `Auto`
-    /// therefore behaves like `Host` until then.
+    /// pipeline.
     async fn select_python_builder(
         &self,
     ) -> Result<(&Arc<dyn PythonBuilder>, BuildMode), RegisterError> {
@@ -709,8 +709,15 @@ impl RegistryService {
             BuildMode::Host => "host",
             BuildMode::Container => "container",
         };
-        metrics::histogram!("open_functions_build_duration_seconds", "mode" => build_mode_label)
-            .record(build_started.elapsed().as_secs_f64());
+        let tool_label = match &build_outcome {
+            Ok(outcome) => outcome.tool.clone(),
+            Err(_) => "unknown".to_string(),
+        };
+        metrics::histogram!(
+            "open_functions_build_duration_seconds",
+            "mode" => build_mode_label, "runtime" => Runtime::Python314.label(), "tool" => tool_label.clone(),
+        )
+        .record(build_started.elapsed().as_secs_f64());
 
         let mut build_record = build;
         build_record.finished_at = Some(chrono::Utc::now());
@@ -719,6 +726,7 @@ impl RegistryService {
                 metrics::counter!(
                     "open_functions_builds_total",
                     "function" => req.name.clone(), "mode" => build_mode_label, "result" => "ok",
+                    "runtime" => Runtime::Python314.label(), "tool" => tool_label.clone(),
                 )
                 .increment(1);
                 build_record.status = BuildStatus::Succeeded;
@@ -729,6 +737,7 @@ impl RegistryService {
                 metrics::counter!(
                     "open_functions_builds_total",
                     "function" => req.name.clone(), "mode" => build_mode_label, "result" => "fail",
+                    "runtime" => Runtime::Python314.label(), "tool" => tool_label.clone(),
                 )
                 .increment(1);
                 build_record.status = BuildStatus::Failed;
@@ -863,8 +872,11 @@ impl RegistryService {
             BuildMode::Host => "host",
             BuildMode::Container => "container",
         };
-        metrics::histogram!("open_functions_build_duration_seconds", "mode" => build_mode_label)
-            .record(build_started.elapsed().as_secs_f64());
+        metrics::histogram!(
+            "open_functions_build_duration_seconds",
+            "mode" => build_mode_label, "runtime" => Runtime::Rust.label(), "tool" => "cargo",
+        )
+        .record(build_started.elapsed().as_secs_f64());
 
         let mut build_record = build;
         build_record.finished_at = Some(chrono::Utc::now());
@@ -873,6 +885,7 @@ impl RegistryService {
                 metrics::counter!(
                     "open_functions_builds_total",
                     "function" => req.name.clone(), "mode" => build_mode_label, "result" => "ok",
+                    "runtime" => Runtime::Rust.label(), "tool" => "cargo",
                 )
                 .increment(1);
                 build_record.status = BuildStatus::Succeeded;
@@ -883,6 +896,7 @@ impl RegistryService {
                 metrics::counter!(
                     "open_functions_builds_total",
                     "function" => req.name.clone(), "mode" => build_mode_label, "result" => "fail",
+                    "runtime" => Runtime::Rust.label(), "tool" => "cargo",
                 )
                 .increment(1);
                 build_record.status = BuildStatus::Failed;
@@ -1091,6 +1105,8 @@ impl RegistryService {
             Trigger::Http => "http",
             Trigger::Pubsub { .. } => "cloudevent",
         };
+        let runtime_label =
+            RuntimeLabel::from_declared(f.runtime, matches!(&f.source, Source::Image { .. }));
 
         let spec = InstanceSpec {
             function_name: name.to_string(),
@@ -1101,6 +1117,7 @@ impl RegistryService {
             memory_mib: f.memory_mib,
             start_timeout: Duration::from_secs(10),
             launch,
+            runtime_label,
         };
 
         let pool_config = PoolConfig {
@@ -1150,7 +1167,69 @@ impl RegistryService {
             self.report_function_state_gauge();
         }
 
+        // FR-108a (US4, T047): only reachable on a *successful* activation,
+        // so a redeploy that fails never costs the still-serving previous
+        // revision its artifact. Also runs during `restore`'s own calls to
+        // this method (every `Ready` function, at startup) -- harmless
+        // (already-pruned revisions are skipped) and lets an interrupted
+        // prune from a prior crash finish on the next restart.
+        self.prune_old_artifacts(name, revision.number).await;
+
         Ok(())
+    }
+
+    /// Deletes the artifact directory (`<artifacts_dir>/<name>/<number>/`,
+    /// covering both the built artifact and `build.log` -- pruning a build's
+    /// log along with it is why `admin.rs`'s `GET .../builds/{id}/log`
+    /// checks `Revision.artifact_pruned` before trying to read the file) for
+    /// every revision of `name` older than `current - 1`, i.e. keeps only
+    /// `current` and `current - 1`'s artifacts (data-model.md's `Revision`
+    /// note, FR-108a). Applies uniformly to Rust and Python revisions (both
+    /// use this same directory layout); image-mode revisions
+    /// (`build_mode: None`, no artifact directory) are skipped. Best-effort:
+    /// a deletion failure is logged and left for the next successful
+    /// activation to retry (the revision is only marked `artifact_pruned` once
+    /// its directory is actually gone), never propagated -- pruning is disk
+    /// hygiene, not a correctness requirement `register`'s caller should see
+    /// fail.
+    async fn prune_old_artifacts(&self, name: &str, current: u32) {
+        if current < 2 {
+            return; // nothing can be older than current - 1 yet
+        }
+        let keep_from = current - 1;
+        for number in 1..keep_from {
+            let revision = match self.store.get_revision(name, number) {
+                Ok(Some(revision)) => revision,
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(function = %name, revision = number, %err, "prune: failed to read revision");
+                    continue;
+                }
+            };
+            if revision.artifact_pruned || revision.build_mode.is_none() {
+                continue;
+            }
+
+            let dir = self.artifacts_dir.join(name).join(number.to_string());
+            match tokio::fs::remove_dir_all(&dir).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::warn!(
+                        function = %name, revision = number, dir = %dir.display(), %err,
+                        "prune: failed to remove old revision's artifact directory; will retry on the next successful activation"
+                    );
+                    continue;
+                }
+            }
+
+            let mut updated = revision;
+            updated.artifact_pruned = true;
+            updated.artifact_path = None;
+            if let Err(err) = self.store.put_revision(&updated) {
+                tracing::warn!(function = %name, revision = number, %err, "prune: removed artifact directory but failed to persist artifact_pruned");
+            }
+        }
     }
 
     /// Creates or fixes the open-pubusb Push subscription for a Pub/Sub-triggered
@@ -1267,6 +1346,11 @@ impl RegistryService {
     /// `delete`) rather than incrementally tracked, since the number of
     /// functions is always small enough that a full re-list is cheap and
     /// this avoids the gauge ever drifting out of sync with reality.
+    /// `open_functions_functions{state,runtime}` (T051, ops-config.md's 002
+    /// delta adds `runtime` to this gauge): every (state, runtime)
+    /// combination is set explicitly, including zero counts -- a series
+    /// that silently disappears rather than reporting 0 is a common
+    /// Prometheus footgun for alerting/dashboards.
     fn report_function_state_gauge(&self) {
         let functions = match self.store.list_functions() {
             Ok(functions) => functions,
@@ -1275,20 +1359,45 @@ impl RegistryService {
                 return;
             }
         };
-        let mut counts = [0u64; 4];
+        const STATES: [(FunctionState, &str); 4] = [
+            (FunctionState::Building, "building"),
+            (FunctionState::Ready, "ready"),
+            (FunctionState::Failed, "failed"),
+            (FunctionState::Deleting, "deleting"),
+        ];
+        const RUNTIMES: [RuntimeLabel; 3] = [
+            RuntimeLabel::Rust,
+            RuntimeLabel::Python314,
+            RuntimeLabel::Image,
+        ];
+
+        let mut counts: HashMap<(&'static str, &'static str), u64> = HashMap::new();
         for f in &functions {
-            let idx = match f.state {
-                FunctionState::Building => 0,
-                FunctionState::Ready => 1,
-                FunctionState::Failed => 2,
-                FunctionState::Deleting => 3,
-            };
-            counts[idx] += 1;
+            let runtime_label =
+                RuntimeLabel::from_declared(f.runtime, matches!(&f.source, Source::Image { .. }));
+            let state_str = STATES
+                .iter()
+                .find(|(state, _)| *state == f.state)
+                .map(|(_, s)| *s)
+                .unwrap_or("building");
+            *counts
+                .entry((state_str, runtime_label.as_str()))
+                .or_insert(0) += 1;
         }
-        metrics::gauge!("open_functions_functions", "state" => "building").set(counts[0] as f64);
-        metrics::gauge!("open_functions_functions", "state" => "ready").set(counts[1] as f64);
-        metrics::gauge!("open_functions_functions", "state" => "failed").set(counts[2] as f64);
-        metrics::gauge!("open_functions_functions", "state" => "deleting").set(counts[3] as f64);
+
+        for (_, state_str) in STATES {
+            for runtime in RUNTIMES {
+                let count = counts
+                    .get(&(state_str, runtime.as_str()))
+                    .copied()
+                    .unwrap_or(0);
+                metrics::gauge!(
+                    "open_functions_functions",
+                    "state" => state_str, "runtime" => runtime.as_str(),
+                )
+                .set(count as f64);
+            }
+        }
     }
 }
 

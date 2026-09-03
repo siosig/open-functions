@@ -46,8 +46,8 @@ fn print_list(body: &serde_json::Value, format: OutputFormat) {
         .unwrap_or(&empty);
 
     println!(
-        "{:<30} {:<8} {:<6} {:<9} REVISION",
-        "NAME", "TRIGGER", "SOURCE", "STATE"
+        "{:<30} {:<8} {:<6} {:<9} {:<9} REVISION",
+        "NAME", "TRIGGER", "SOURCE", "RUNTIME", "STATE"
     );
     for f in functions {
         let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("-");
@@ -57,12 +57,14 @@ fn print_list(body: &serde_json::Value, format: OutputFormat) {
             .and_then(|v| v.as_str())
             .unwrap_or("-");
         let source = f.get("source_kind").and_then(|v| v.as_str()).unwrap_or("-");
+        // `rust` | `python314` | `-` (image-mode with no declared runtime).
+        let runtime = f.get("runtime").and_then(|v| v.as_str()).unwrap_or("-");
         let state = f.get("state").and_then(|v| v.as_str()).unwrap_or("-");
         let revision = f
             .get("current_revision")
             .filter(|v| !v.is_null())
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".to_string());
-        println!("{name:<30} {trigger:<8} {source:<6} {state:<9} {revision}");
+        println!("{name:<30} {trigger:<8} {source:<6} {runtime:<9} {state:<9} {revision}");
     }
 }

@@ -42,6 +42,16 @@
 # The source directory bind mount must use the same path inside the
 # container as on the host, since open-functions resolves function source paths as
 # given to it (see docker/config.toml and ops-config.md for details).
+#
+# No Python in this image (002-python-runtime): the runtime stage below is
+# gcr.io/distroless/cc-debian12:nonroot -- no shell, no package manager, so
+# it cannot install python3.14/uv even if we wanted to, and doing so would
+# also defeat the point of a distroless runtime image (minimal attack
+# surface, no interpreter/toolchain to keep patched). Python functions are
+# therefore always built and run via python.mode = "container" from this
+# image (see docker/config.toml's [python] section and the Docker-socket
+# note above) -- the same nested-build mechanism already used for
+# source-mode Rust builds and image-mode functions.
 
 ########################################
 # Stage: chef - shared base with cargo-chef installed

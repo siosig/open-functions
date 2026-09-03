@@ -1,14 +1,18 @@
-//! End-to-end test for User Story 2 (T048): against a *real* open-pubusb instance,
-//! creates a topic, deploys `examples/hello-pubsub` with `--trigger-topic`,
-//! publishes a message, confirms it reaches the function (via its structured
-//! stdout log line, captured through open-functions's own process — see
+//! End-to-end test for User Story 2 (T048, parametrized for 002-python-runtime's
+//! T037): against a *real* open-pubusb instance, creates a topic, deploys a
+//! Pub/Sub-triggered function with `--trigger-topic`, publishes a message,
+//! confirms it reaches the function (via its structured stdout log line,
+//! captured through open-functions's own process -- see
 //! `runtime::process::spawn_log_drain`, which re-emits a function instance's
-//! captured stdout as a `tracing` event on `open-functions serve`'s own stdout), then
-//! deletes the function and confirms the open-pubusb subscription is torn down.
+//! captured stdout as a `tracing` event on `open-functions serve`'s own
+//! stdout), then deletes the function and confirms the open-pubusb
+//! subscription is torn down. `run_pubsub_e2e_case` is the shared helper;
+//! the Rust case (`examples/hello-pubsub`) and the Python case
+//! (`examples/hello-python-pubsub`) both run it.
 //!
 //! Opt-in and skipped by default: it needs a real, running open-pubusb (this
-//! workspace has no way to spin one up itself — open-pubusb is a sibling project).
-//! Set `OPEN_FUNCTIONS_TEST_OPEN_PUBUSB_URL` (e.g. `http://127.0.0.1:8085`) to run it.
+//! workspace has no way to spin one up itself -- open-pubusb is a sibling
+//! project). Set `OPEN_FUNCTIONS_TEST_OPEN_PUBUSB_URL` (e.g. `http://127.0.0.1:8085`) to run it.
 //! When that open-pubusb runs in a container, also set
 //! `OPEN_FUNCTIONS_TEST_INVOKE_BIND` / `OPEN_FUNCTIONS_TEST_PUSH_BASE_URL` so its
 //! Push deliveries can route back to this process (see `spawn_serve`).
@@ -28,13 +32,21 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
 use serde_json::{Value, json};
+
+fn python314_available() -> bool {
+    std::process::Command::new("python3.14")
+        .args(["-c", "import sys; print(sys.version_info[:2])"])
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "(3, 14)")
+        .unwrap_or(false)
+}
 
 /// A running `open-functions serve` subprocess with its stdout captured line-by-line
 /// into `log_lines` (rather than discarded, as `e2e_http.rs`'s does) so the
@@ -60,10 +72,6 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("workspace root")
         .to_path_buf()
-}
-
-fn hello_pubsub_dir() -> PathBuf {
-    workspace_root().join("examples/hello-pubsub")
 }
 
 fn spawn_stdout_collector(stdout: ChildStdout) -> Arc<Mutex<Vec<String>>> {
@@ -187,16 +195,24 @@ async fn publish(
     );
 }
 
-#[tokio::test]
-async fn topic_publish_reaches_function_and_delete_removes_subscription() {
-    let Ok(open_pubusb_url) = std::env::var("OPEN_FUNCTIONS_TEST_OPEN_PUBUSB_URL") else {
-        eprintln!(
-            "skipping topic_publish_reaches_function_and_delete_removes_subscription: \
-             set OPEN_FUNCTIONS_TEST_OPEN_PUBUSB_URL (e.g. http://127.0.0.1:8085) to run against a real open-pubusb"
-        );
-        return;
-    };
-    let open_pubusb_url = open_pubusb_url.trim_end_matches('/').to_string();
+/// Shared E2E case body (T037): deploys `source_dir`/`entry_point` as a
+/// Pub/Sub-triggered function against a real open-pubusb, publishes a
+/// message, confirms the marker reaches the function's log, deletes the
+/// function, and confirms the subscription disappears. `function_name` must
+/// be unique per call within a test run (each spawns its own `serve` on its
+/// own ports, so no two cases actually race, but the subscription/topic
+/// names on the shared open-pubusb instance must not collide).
+async fn run_pubsub_e2e_case(
+    function_name: &str,
+    source_dir: &Path,
+    entry_point: &str,
+    invoke_port: u16,
+    admin_port: u16,
+) {
+    let open_pubusb_url = std::env::var("OPEN_FUNCTIONS_TEST_OPEN_PUBUSB_URL")
+        .expect("caller must check OPEN_FUNCTIONS_TEST_OPEN_PUBUSB_URL before calling")
+        .trim_end_matches('/')
+        .to_string();
     let project = "local";
     let topic = format!("open-functions-e2e-{}", uuid::Uuid::new_v4().simple());
 
@@ -204,19 +220,26 @@ async fn topic_publish_reaches_function_and_delete_removes_subscription() {
     create_topic(&client, &open_pubusb_url, project, &topic).await;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let server = spawn_serve(data_dir.path(), 28280, 28281, &open_pubusb_url, project).await;
+    let server = spawn_serve(
+        data_dir.path(),
+        invoke_port,
+        admin_port,
+        &open_pubusb_url,
+        project,
+    )
+    .await;
 
     let deploy_resp = client
-        .put(format!("{}/v1/functions/on-e2e", server.admin_url))
+        .put(format!("{}/v1/functions/{function_name}", server.admin_url))
         .json(&json!({
             "trigger": {"type": "pubsub", "topic": topic},
-            "source": {"kind": "dir", "path": hello_pubsub_dir().to_string_lossy()},
-            "entry_point": "on_msg",
+            "source": {"kind": "dir", "path": source_dir.to_string_lossy()},
+            "entry_point": entry_point,
         }))
         .timeout(Duration::from_secs(300))
         .send()
         .await
-        .expect("PUT /v1/functions/on-e2e");
+        .expect("PUT /v1/functions/{function_name}");
     assert_eq!(deploy_resp.status(), 202);
 
     // Poll until the build finishes (ready) before publishing, so the first
@@ -224,7 +247,7 @@ async fn topic_publish_reaches_function_and_delete_removes_subscription() {
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     loop {
         let describe: Value = client
-            .get(format!("{}/v1/functions/on-e2e", server.admin_url))
+            .get(format!("{}/v1/functions/{function_name}", server.admin_url))
             .send()
             .await
             .expect("describe")
@@ -266,14 +289,14 @@ async fn topic_publish_reaches_function_and_delete_removes_subscription() {
     );
 
     let delete_resp = client
-        .delete(format!("{}/v1/functions/on-e2e", server.admin_url))
+        .delete(format!("{}/v1/functions/{function_name}", server.admin_url))
         .send()
         .await
         .expect("DELETE function");
     assert_eq!(delete_resp.status(), 202);
 
     let sub_gone_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    let sub_name = "open-functions-on-e2e";
+    let sub_name = format!("open-functions-{function_name}");
     loop {
         let resp = client
             .get(format!(
@@ -293,7 +316,7 @@ async fn topic_publish_reaches_function_and_delete_removes_subscription() {
     }
 
     // The topic is this test's own (uuid-suffixed) resource, and open-pubusb
-    // is a long-lived shared instance here — without this, every run leaves
+    // is a long-lived shared instance here -- without this, every run leaves
     // another `open-functions-e2e-<uuid>` topic behind forever. Best-effort:
     // a failure to clean up must not fail an otherwise-passing test.
     let _ = client
@@ -302,4 +325,37 @@ async fn topic_publish_reaches_function_and_delete_removes_subscription() {
         ))
         .send()
         .await;
+}
+
+#[tokio::test]
+async fn rust_topic_publish_reaches_function_and_delete_removes_subscription() {
+    if std::env::var("OPEN_FUNCTIONS_TEST_OPEN_PUBUSB_URL").is_err() {
+        eprintln!(
+            "skipping rust_topic_publish_reaches_function_and_delete_removes_subscription: \
+             set OPEN_FUNCTIONS_TEST_OPEN_PUBUSB_URL (e.g. http://127.0.0.1:8085) to run against a real open-pubusb"
+        );
+        return;
+    }
+    let source_dir = workspace_root().join("examples/hello-pubsub");
+    run_pubsub_e2e_case("on-e2e", &source_dir, "on_msg", 28280, 28281).await;
+}
+
+#[tokio::test]
+async fn python_topic_publish_reaches_function_and_delete_removes_subscription() {
+    if std::env::var("OPEN_FUNCTIONS_TEST_OPEN_PUBUSB_URL").is_err() {
+        eprintln!(
+            "skipping python_topic_publish_reaches_function_and_delete_removes_subscription: \
+             set OPEN_FUNCTIONS_TEST_OPEN_PUBUSB_URL (e.g. http://127.0.0.1:8085) to run against a real open-pubusb"
+        );
+        return;
+    }
+    if !python314_available() {
+        eprintln!(
+            "skipping python_topic_publish_reaches_function_and_delete_removes_subscription: \
+             python3.14 not found on PATH"
+        );
+        return;
+    }
+    let source_dir = workspace_root().join("examples/hello-python-pubsub");
+    run_pubsub_e2e_case("on-e2e-py", &source_dir, "on_msg", 28282, 28283).await;
 }

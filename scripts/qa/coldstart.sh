@@ -20,10 +20,10 @@ usage() {
   cat <<'EOF'
 Usage: scripts/qa/coldstart.sh [FUNCTION_NAME]
 
-Deploys FUNCTION_NAME (default: hello) from examples/hello-http as a
-throwaway function, scales it to zero, then measures the time-to-first-byte
-(TTFB) of the single request that triggers its process-mode cold start.
-Fails if TTFB is not under 1 second.
+Deploys FUNCTION_NAME (default: hello) from SOURCE_DIR as a throwaway
+function, scales it to zero, then measures the time-to-first-byte (TTFB) of
+the single request that triggers its cold start. Fails if TTFB is not under
+1 second.
 
 Environment variables:
   OPEN_FUNCTIONS_BIN             Path to the open-functions binary. Defaults to
@@ -31,6 +31,19 @@ Environment variables:
                         is set, else <repo_root>/target/release/open-functions. Built
                         via `cargo build --release -p open-functions` first if
                         missing.
+  SOURCE_DIR             Source directory to deploy (default
+                        <repo_root>/examples/hello-http). Set to
+                        examples/hello-python-http (with ENTRY_POINT=hello)
+                        to measure a Python host-mode cold start instead.
+  ENTRY_POINT            entry_point to deploy with (default "hello").
+  PYTHON_MODE             When set, exported as
+                        OPEN_FUNCTIONS__PYTHON__MODE for the spawned `serve`
+                        process (e.g. "container", to force the Python
+                        build/run pipeline through Docker instead of
+                        "auto"'s host-first preference -- see
+                        specs/002-python-runtime/contracts/ops-config.md's
+                        [python] section). Unset by default (server default
+                        "auto" applies).
   ADMIN_PORT            Admin API port to bind (default 19181).
   INVOKE_PORT           Invoke listener port to bind (default 19180).
   DEPLOY_TIMEOUT_SECS   Seconds to wait for the initial deploy to reach
@@ -95,8 +108,12 @@ if [[ ! -x "$OPEN_FUNCTIONS_BIN" ]]; then
 fi
 log "Using open-functions binary: $OPEN_FUNCTIONS_BIN"
 
-HELLO_HTTP_DIR="$REPO_ROOT/examples/hello-http"
-[[ -d "$HELLO_HTTP_DIR" ]] || fail "examples/hello-http not found at $HELLO_HTTP_DIR"
+SOURCE_DIR="${SOURCE_DIR:-$REPO_ROOT/examples/hello-http}"
+[[ -d "$SOURCE_DIR" ]] || fail "SOURCE_DIR not found at $SOURCE_DIR"
+ENTRY_POINT="${ENTRY_POINT:-hello}"
+if [[ -n "${PYTHON_MODE:-}" ]]; then
+  export OPEN_FUNCTIONS__PYTHON__MODE="$PYTHON_MODE"
+fi
 
 ADMIN_PORT="${ADMIN_PORT:-19181}"
 INVOKE_PORT="${INVOKE_PORT:-19180}"
@@ -249,9 +266,9 @@ wait_for_ready "$READY_TIMEOUT_SECS" \
   || fail "open-functions serve (pid $SERVE_PID) did not become ready within ${READY_TIMEOUT_SECS}s. Log: $DATA_DIR/serve.log"
 log "open-functions serve is ready (pid $SERVE_PID)"
 
-log "Deploying $FN_NAME from $HELLO_HTTP_DIR (source-mode; this triggers a real cold build and may take a few minutes)"
-DEPLOY_BODY=$(jq -n --arg path "$HELLO_HTTP_DIR" \
-  '{trigger: {type: "http"}, source: {kind: "dir", path: $path}, entry_point: "hello"}')
+log "Deploying $FN_NAME from $SOURCE_DIR (source-mode; this triggers a real cold build and may take a few minutes)"
+DEPLOY_BODY=$(jq -n --arg path "$SOURCE_DIR" --arg entry "$ENTRY_POINT" \
+  '{trigger: {type: "http"}, source: {kind: "dir", path: $path}, entry_point: $entry}')
 http_call PUT "$ADMIN_URL/v1/functions/$FN_NAME" "$DEPLOY_BODY"
 expect_status "$HTTP_STATUS" 202 "PUT /v1/functions/$FN_NAME" "$HTTP_BODY"
 

@@ -260,6 +260,58 @@ async fn missing_entry_point_fails_as_entry_point_error_with_attributeerror_in_l
 }
 
 #[tokio::test]
+async fn a_retry_at_the_same_artifact_dir_after_a_failed_build_succeeds() {
+    // Regression: a build attempt that fails after venv creation (e.g. the
+    // missing-entry-point case above) leaves a partial venv behind. Because
+    // a revision number is only advanced on *success* (registry::service's
+    // `existing.current_revision + 1`, reused across repeated failures), a
+    // retry -- with the problem fixed -- targets the exact same
+    // `artifact_dir`/`venv_dir`. `uv venv`/`python -m venv` used to refuse
+    // to create a venv over one that already exists, so the retry failed on
+    // the venv step regardless of whether the real problem was fixed.
+    require_python314!();
+    let source_dir = tempfile::tempdir().expect("tempdir");
+    let artifact_dir = tempfile::tempdir().expect("tempdir");
+    let cache_root = tempfile::tempdir().expect("tempdir");
+
+    write_source(
+        source_dir.path(),
+        "def not_hello(request):\n    return 'hi'\n",
+        None,
+    );
+    let failing_request = base_request(
+        source_dir.path().to_path_buf(),
+        artifact_dir.path(),
+        cache_root.path(),
+        Installer::Auto,
+    );
+    builder()
+        .build(&failing_request)
+        .await
+        .expect_err("first attempt should fail: main.py has no `hello` attribute");
+    assert!(
+        artifact_dir.path().join("venv/bin").is_dir(),
+        "the failed attempt should have left a partial venv behind, or this test isn't exercising the collision"
+    );
+
+    write_source(
+        source_dir.path(),
+        "def hello(request):\n    return 'hi'\n",
+        None,
+    );
+    let retry_request = base_request(
+        source_dir.path().to_path_buf(),
+        artifact_dir.path(),
+        cache_root.path(),
+        Installer::Auto,
+    );
+    builder()
+        .build(&retry_request)
+        .await
+        .expect("retry at the same artifact_dir, with the problem fixed, should succeed");
+}
+
+#[tokio::test]
 async fn python_bin_pointing_at_a_312_interpreter_is_rejected_as_unsupported() {
     require_python314!();
     let python312_available = std::process::Command::new("python3.12")

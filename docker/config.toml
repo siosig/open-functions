@@ -35,3 +35,13 @@ mode = "container"
 # suppresses the cgroup-unavailable startup warning; memory limits per
 # function instance are simply not enforced by open-functions itself in that case.
 cgroup = "off"
+
+[python]
+# Same reasoning as [build] above: the distributed runtime image
+# (gcr.io/distroless/cc-debian12:nonroot) has no Python/uv of its own and
+# cannot gain one (distroless has no package manager) -- see the Dockerfile
+# header comment for why. "auto"/"host" would only ever fail to find an
+# interpreter inside this image, so "container" (driving Python builds
+# through the Docker socket, same as [build].mode = "container") is the
+# only mode that can ever work here.
+mode = "container"

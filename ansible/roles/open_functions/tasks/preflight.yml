@@ -40,6 +40,50 @@
     open_functions_deploy_mode == 'docker' or
     open_functions_admin_bind_address not in ['127.0.0.1', '::1', 'localhost']
 
+- name: Assert open_functions_python_mode is supported
+  ansible.builtin.assert:
+    that:
+      - open_functions_python_mode in ['auto', 'host', 'container']
+    fail_msg: >-
+      open_functions_python_mode must be "auto", "host", or "container", got
+      "{{ open_functions_python_mode }}".
+    quiet: true
+
+- name: Assert open_functions_python_installer is supported
+  ansible.builtin.assert:
+    that:
+      - open_functions_python_installer in ['auto', 'uv', 'pip']
+    fail_msg: >-
+      open_functions_python_installer must be "auto", "uv", or "pip", got
+      "{{ open_functions_python_installer }}".
+    quiet: true
+
+- name: Assert docker deploy mode always uses python.mode = container
+  ansible.builtin.assert:
+    that:
+      - open_functions_python_mode == 'container'
+    fail_msg: >-
+      open_functions_deploy_mode is "docker", so open_functions_python_mode must
+      be "container" - the distributed open-functions image has no Python/uv
+      of its own (see docker/Dockerfile's header comment), so "auto"/"host"
+      could never find a usable interpreter inside that container.
+    quiet: true
+  when: open_functions_deploy_mode == 'docker'
+
+- name: Assert python.mode = container requires open_functions_enable_docker
+  ansible.builtin.assert:
+    that:
+      - open_functions_enable_docker | bool
+    fail_msg: >-
+      open_functions_python_mode is "container", which needs a reachable
+      Docker daemon to resolve Python dependencies - set
+      open_functions_enable_docker: true (this grants the systemd unit
+      SupplementaryGroups=docker / bind-mounts the docker socket into the
+      container, per the docker connectivity this role already sets up for
+      open_functions_build_mode = container).
+    quiet: true
+  when: open_functions_python_mode == 'container'
+
 - name: Gather target host facts required for preflight checks
   ansible.builtin.setup:
     gather_subset:

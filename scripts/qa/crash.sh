@@ -40,9 +40,9 @@ usage() {
   cat <<'EOF'
 Usage: scripts/qa/crash.sh
 
-Deploys two functions from examples/hello-http: "stable" (normal) and
-"crasher" (CRASH=1, crashes on every request). Calls crasher once and
-asserts HTTP 500. Calls stable 10 times and asserts 100% success (200),
+Deploys two functions from SOURCE_DIR: STABLE_FN (normal) and CRASHER_FN
+(CRASH=1, crashes on every request). Calls crasher once and asserts a
+non-2xx outcome. Calls stable 10 times and asserts 100% success (200),
 proving the crash did not affect it. Redeploys crasher without CRASH=1 and
 calls it again, asserting 200 -- proving the pool restarts a fresh instance
 on the next call after a crash.
@@ -53,6 +53,20 @@ Environment variables:
                         is set, else <repo_root>/target/release/open-functions. Built
                         via `cargo build --release -p open-functions` first if
                         missing.
+  STABLE_FN           Function name for the non-crashing deploy (default "stable").
+  CRASHER_FN          Function name for the CRASH=1 deploy (default "crasher").
+  SOURCE_DIR          Source directory deployed as both functions (default
+                       <repo_root>/examples/hello-http). Set to
+                       examples/hello-python-http (with ENTRY_POINT=hello)
+                       to exercise Python instead -- CRASH=1 there calls
+                       `os._exit(1)` too (examples/hello-python-http/main.py),
+                       but gunicorn's WORKERS=1 master respawns a fresh
+                       worker rather than the whole process ever exiting
+                       (see runtime_python_process.rs's own documented
+                       finding), so the crashing call's own status/timing is
+                       unreliable there -- this script only asserts it is
+                       *not* a clean 200, not a specific status.
+  ENTRY_POINT         entry_point to deploy with (default "hello").
   ADMIN_PORT            Admin API port to bind (default 19185).
   INVOKE_PORT           Invoke listener port to bind (default 19184).
   DEPLOY_TIMEOUT_SECS   Seconds to wait for each deploy (initial and
@@ -61,10 +75,14 @@ Environment variables:
                         minutes -- the redeploy is normally much faster
                         thanks to cargo's incremental build cache).
   READY_TIMEOUT_SECS    Seconds to wait for /readyz after start (default 30).
+  CRASH_CALL_TIMEOUT_SECS  Bounded client-side timeout for the one crashing
+                        call (default 5) -- kept short and independent of
+                        DEPLOY_TIMEOUT_SECS since that call's connection can
+                        hang rather than reset (see SOURCE_DIR above).
 
 Exit codes:
-  0  crasher returned 500 on its first call, stable returned 200 on all 10
-     calls, and crasher returned 200 after being redeployed clean
+  0  crasher's call did not return a clean 200, stable returned 200 on all
+     10 calls, and crasher returned 200 after being redeployed clean
   1  any of the above assertions failed, or a broken invariant/failed HTTP
      call/setup step
   2  usage error (bad arguments)
@@ -82,8 +100,8 @@ if [[ $# -gt 0 ]]; then
   exit 2
 fi
 
-STABLE_FN="stable"
-CRASHER_FN="crasher"
+STABLE_FN="${STABLE_FN:-stable}"
+CRASHER_FN="${CRASHER_FN:-crasher}"
 
 log() {
   printf '[%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"
@@ -113,13 +131,15 @@ if [[ ! -x "$OPEN_FUNCTIONS_BIN" ]]; then
 fi
 log "Using open-functions binary: $OPEN_FUNCTIONS_BIN"
 
-HELLO_HTTP_DIR="$REPO_ROOT/examples/hello-http"
-[[ -d "$HELLO_HTTP_DIR" ]] || fail "examples/hello-http not found at $HELLO_HTTP_DIR"
+SOURCE_DIR="${SOURCE_DIR:-$REPO_ROOT/examples/hello-http}"
+[[ -d "$SOURCE_DIR" ]] || fail "SOURCE_DIR not found at $SOURCE_DIR"
+ENTRY_POINT="${ENTRY_POINT:-hello}"
 
 ADMIN_PORT="${ADMIN_PORT:-19185}"
 INVOKE_PORT="${INVOKE_PORT:-19184}"
 DEPLOY_TIMEOUT_SECS="${DEPLOY_TIMEOUT_SECS:-600}"
 READY_TIMEOUT_SECS="${READY_TIMEOUT_SECS:-30}"
+CRASH_CALL_TIMEOUT_SECS="${CRASH_CALL_TIMEOUT_SECS:-5}"
 CURL_TIMEOUT="${DEPLOY_TIMEOUT_SECS}"
 ADMIN_URL="http://127.0.0.1:${ADMIN_PORT}"
 INVOKE_URL="http://127.0.0.1:${INVOKE_PORT}"
@@ -246,12 +266,11 @@ wait_for_function_ready() {
 
 deploy_json() {
   # deploy_json ENV_JSON
-  # Builds the PUT /v1/functions/{name} body for examples/hello-http,
-  # entry_point "hello", with the given env map (e.g. '{}' or
-  # '{"CRASH": "1"}').
+  # Builds the PUT /v1/functions/{name} body for SOURCE_DIR/ENTRY_POINT,
+  # with the given env map (e.g. '{}' or '{"CRASH": "1"}').
   local env_json="$1"
-  jq -n --arg path "$HELLO_HTTP_DIR" --argjson env "$env_json" \
-    '{trigger: {type: "http"}, source: {kind: "dir", path: $path}, entry_point: "hello", env: $env}'
+  jq -n --arg path "$SOURCE_DIR" --arg entry "$ENTRY_POINT" --argjson env "$env_json" \
+    '{trigger: {type: "http"}, source: {kind: "dir", path: $path}, entry_point: $entry, env: $env}'
 }
 
 deploy_function() {
@@ -267,18 +286,20 @@ wait_for_ready "$READY_TIMEOUT_SECS" \
   || fail "open-functions serve (pid $SERVE_PID) did not become ready within ${READY_TIMEOUT_SECS}s. Log: $DATA_DIR/serve.log"
 log "open-functions serve is ready (pid $SERVE_PID)"
 
-log "Deploying $STABLE_FN from $HELLO_HTTP_DIR (normal env; this triggers a real cold build and may take a few minutes)"
+log "Deploying $STABLE_FN from $SOURCE_DIR (normal env; this triggers a real cold build and may take a few minutes)"
 deploy_function "$STABLE_FN" '{}'
 log "$STABLE_FN is ready"
 
-log "Deploying $CRASHER_FN from $HELLO_HTTP_DIR (env CRASH=1)"
+log "Deploying $CRASHER_FN from $SOURCE_DIR (env CRASH=1)"
 deploy_function "$CRASHER_FN" '{"CRASH": "1"}'
 log "$CRASHER_FN is ready"
 
-log "Calling $CRASHER_FN once (expected to crash mid-request -> connection reset -> HTTP 500)"
-http_call GET "$INVOKE_URL/$CRASHER_FN"
-expect_status "$HTTP_STATUS" 500 "first call to $CRASHER_FN (crash-during-request)" "$HTTP_BODY"
-log "$CRASHER_FN's crashing call correctly returned HTTP 500"
+log "Calling $CRASHER_FN once (expected to crash mid-request; bounded to ${CRASH_CALL_TIMEOUT_SECS}s since the connection can hang rather than reset, see SOURCE_DIR in --help)"
+crash_status=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$CRASH_CALL_TIMEOUT_SECS" "$INVOKE_URL/$CRASHER_FN" || echo "000")
+if [[ "$crash_status" == "200" ]]; then
+  fail "the crashing call to $CRASHER_FN returned a clean 200 (expected it NOT to): $crash_status"
+fi
+log "$CRASHER_FN's crashing call did not return a clean 200 (got: $crash_status), as expected"
 
 log "Calling $STABLE_FN 10 times, asserting 100% success (crasher's crash must not affect it)"
 for i in $(seq 1 10); do

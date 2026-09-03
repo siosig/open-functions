@@ -14,6 +14,7 @@ use axum::routing::get;
 use axum::{Router, middleware};
 use futures_util::StreamExt;
 use open_functions_core::logs::pipe::LogRecord;
+use open_functions_core::model::binding::BindingState;
 use open_functions_core::model::build::BuildStatus;
 use open_functions_core::model::function::{Function, Source, Trigger};
 use open_functions_core::model::runtime::Runtime;
@@ -97,9 +98,30 @@ async fn healthz() -> impl IntoResponse {
 
 async fn readyz(State(state): State<AdminState>) -> impl IntoResponse {
     if state.ready.load(Ordering::SeqCst) {
+        let (functions, bindings_pending) = match state.registry.list() {
+            Ok(functions) => {
+                let pending = functions
+                    .iter()
+                    .filter(|f| matches!(f.trigger, Trigger::Pubsub { .. }))
+                    .filter(|f| {
+                        matches!(
+                            state.registry.get_binding(&f.name),
+                            Ok(Some(b)) if b.state == BindingState::Pending
+                        )
+                    })
+                    .count();
+                (functions.len(), pending)
+            }
+            Err(err) => {
+                tracing::warn!(%err, "readyz: failed to list functions for the functions/bindings_pending counts");
+                (0, 0)
+            }
+        };
         (
             StatusCode::OK,
-            Json(json!({"status": "ready", "functions": 0, "bindings_pending": 0})),
+            Json(
+                json!({"status": "ready", "functions": functions, "bindings_pending": bindings_pending}),
+            ),
         )
     } else {
         (
@@ -432,6 +454,21 @@ async fn get_build_log(
         Ok(None) => return api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "build not found"),
         Err(err) => return store_error_response(&err),
     };
+
+    // T048 (002-python-runtime US4): `prune_old_artifacts` deletes the
+    // whole revision directory, `build.log` included -- check
+    // `Revision.artifact_pruned` up front so a pruned build reports a clean
+    // 404 rather than a misleading 500 from the file read below failing.
+    match state
+        .registry
+        .get_revision(&build.function_name, build.revision)
+    {
+        Ok(Some(revision)) if revision.artifact_pruned => {
+            return api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "build log pruned");
+        }
+        Ok(_) => {}
+        Err(err) => return store_error_response(&err),
+    }
 
     if !query.follow.unwrap_or(false) {
         return match tokio::fs::read_to_string(&build.log_path).await {

@@ -357,3 +357,145 @@ async fn python_host_function_matches_rust_reference_and_supports_the_full_lifec
         "expected tool to be uv or pip, got {tool:?}"
     );
 }
+
+// ---- T046 (002-python-runtime, US4): pruning + restart reproducibility ----
+
+#[tokio::test]
+async fn three_deploys_prune_rev1_and_survive_a_restart_without_rebuilding() {
+    require_python314!();
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let mut server = spawn_serve(data_dir.path(), 28480, 28481).await;
+    let client = reqwest::Client::new();
+
+    for i in 1..=3 {
+        let deploy = client
+            .put(format!("{}/v1/functions/hello-py", server.admin_url))
+            .json(&json!({
+                "trigger": {"type": "http"},
+                "source": {"kind": "dir", "path": hello_python_http_dir().to_string_lossy()},
+                "entry_point": "hello",
+                "env": {"DEPLOY_ITERATION": i.to_string()},
+            }))
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await
+            .expect("deploy PUT");
+        assert_eq!(deploy.status(), 202, "deploy #{i}");
+        wait_for_ready(&client, &server.admin_url, "hello-py").await;
+    }
+
+    let describe: Value = client
+        .get(format!("{}/v1/functions/hello-py", server.admin_url))
+        .send()
+        .await
+        .expect("describe")
+        .json()
+        .await
+        .expect("describe JSON");
+    assert_eq!(describe["current_revision"], 3);
+    let revisions = describe["revisions"]
+        .as_array()
+        .expect("revisions should be an array");
+    assert_eq!(
+        revisions.len(),
+        3,
+        "all 3 revisions should still be recorded"
+    );
+
+    let rev1 = revisions
+        .iter()
+        .find(|r| r["number"] == 1)
+        .expect("revision 1 should be present");
+    assert_eq!(
+        rev1["artifact_pruned"], true,
+        "revision 1 (current - 2) must be pruned"
+    );
+    let rev1_build_id = rev1["build_id"].as_str().expect("build_id").to_string();
+
+    let rev2 = revisions
+        .iter()
+        .find(|r| r["number"] == 2)
+        .expect("revision 2 should be present");
+    assert_eq!(
+        rev2["artifact_pruned"], false,
+        "revision 2 (current - 1) must NOT be pruned"
+    );
+
+    let build_count_before_restart = describe["builds"]
+        .as_array()
+        .expect("builds should be an array")
+        .len();
+    assert_eq!(build_count_before_restart, 3);
+
+    // Pruned build's log is a clean 404, not a 500 from a failed file read.
+    let log_resp = client
+        .get(format!(
+            "{}/v1/functions/hello-py/builds/{rev1_build_id}/log",
+            server.admin_url
+        ))
+        .send()
+        .await
+        .expect("GET pruned build log");
+    assert_eq!(log_resp.status(), 404);
+    let log_body: Value = log_resp.json().await.expect("error body JSON");
+    assert_eq!(log_body["error"], "build log pruned");
+    assert_eq!(log_body["code"], "NOT_FOUND");
+
+    // SIGTERM + relaunch against the *same* data_dir, mirroring
+    // `scripts/qa/restart-loop.sh`'s own mechanism.
+    let pid = server.child.id();
+    let kill_status = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("invoke `kill -TERM`");
+    assert!(kill_status.success(), "kill -TERM {pid} failed to run");
+
+    let exit_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(_status) = server.child.try_wait().expect("try_wait") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < exit_deadline,
+            "open-functions serve did not exit within 15s of SIGTERM"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    server = spawn_serve(data_dir.path(), 28480, 28481).await;
+
+    let describe_after_restart: Value = client
+        .get(format!("{}/v1/functions/hello-py", server.admin_url))
+        .send()
+        .await
+        .expect("describe after restart")
+        .json()
+        .await
+        .expect("describe JSON");
+    assert_eq!(describe_after_restart["current_revision"], 3);
+    assert_eq!(
+        describe_after_restart["revisions"]
+            .as_array()
+            .expect("revisions array")
+            .len(),
+        3,
+        "revisions must not grow or shrink across a restart"
+    );
+    assert_eq!(
+        describe_after_restart["builds"]
+            .as_array()
+            .expect("builds array")
+            .len(),
+        build_count_before_restart,
+        "no rebuild should have been triggered by the restart"
+    );
+
+    let invoke_resp = client
+        .get(format!("{}/hello-py/world?x=1", server.invoke_url))
+        .send()
+        .await
+        .expect("GET /hello-py/world after restart");
+    assert_eq!(invoke_resp.status(), 200);
+    let body = invoke_resp.text().await.expect("body");
+    assert_eq!(body, "Hello /world?x=1");
+}

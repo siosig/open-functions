@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 use open_functions_core::logs::ring::LogStore;
+use open_functions_core::model::runtime::RuntimeLabel;
 use open_functions_core::pool::{AcquireError, InstancePool, PoolConfig, QueuePolicy};
 use open_functions_core::runtime::InstanceSpec;
 use open_functions_core::runtime::cgroup::CgroupLimiter;
@@ -65,6 +66,7 @@ fn base_spec(artifact_path: PathBuf) -> InstanceSpec {
         memory_mib: 128,
         start_timeout: Duration::from_secs(10),
         launch: open_functions_core::runtime::Launch::rust_process(artifact_path),
+        runtime_label: RuntimeLabel::Rust,
     }
 }
 

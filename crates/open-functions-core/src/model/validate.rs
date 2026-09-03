@@ -249,9 +249,18 @@ pub fn validate_function(f: &Function) -> Result<(), ValidationError> {
 
     validate_env(&f.env)?;
 
-    if f.runtime == Some(Runtime::Python314) {
+    // Python-specific rules apply only to source-mode: image-mode's
+    // `runtime` is a display-only hint (data-model.md's "validation rules
+    // (delta)" section: "source.kind = image: runtime is optional and
+    // never validated"), so an image-mode function declaring
+    // `runtime = python314` must not be rejected for an
+    // `entry_point` shape or a `bin` field that only matter when open-functions
+    // itself builds and launches a Python venv.
+    if f.runtime == Some(Runtime::Python314)
+        && let Source::Dir { bin, .. } = &f.source
+    {
         validate_python_entry_point(&f.entry_point)?;
-        if let Source::Dir { bin: Some(_), .. } = &f.source {
+        if bin.is_some() {
             return Err(ValidationError::BinNotApplicableToPython);
         }
     }

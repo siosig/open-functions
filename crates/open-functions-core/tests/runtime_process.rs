@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use open_functions_core::logs::ring::LogStore;
+use open_functions_core::model::runtime::RuntimeLabel;
 use open_functions_core::runtime::cgroup::CgroupLimiter;
 use open_functions_core::runtime::process::ProcessDriver;
 use open_functions_core::runtime::{Driver, DriverError, InstanceExit, InstanceSpec};
@@ -64,6 +65,7 @@ fn base_spec(artifact_path: PathBuf) -> InstanceSpec {
         memory_mib: 128,
         start_timeout: Duration::from_secs(10),
         launch: open_functions_core::runtime::Launch::rust_process(artifact_path),
+        runtime_label: RuntimeLabel::Rust,
     }
 }
 
@@ -289,6 +291,7 @@ async fn launch_process_honors_args_and_cwd() {
             ],
             cwd: Some(cwd.path().to_path_buf()),
         },
+        runtime_label: RuntimeLabel::Python314,
     };
 
     let handle = driver

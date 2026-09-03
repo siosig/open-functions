@@ -11,6 +11,7 @@ use std::time::Duration;
 use open_functions_core::build::container::ContainerBuilder;
 use open_functions_core::build::host_cargo::HostCargoBuilder;
 use open_functions_core::build::python::Installer as PythonInstaller;
+use open_functions_core::build::python::container::ContainerPythonBuilder;
 use open_functions_core::build::python::env::passthrough_env;
 use open_functions_core::build::python::host::HostPythonBuilder;
 use open_functions_core::logs::ring::LogStore;
@@ -66,7 +67,26 @@ pub async fn run(cfg: AppConfig) -> ExitCode {
         tracing::error!(data_dir = %cfg.storage.data_dir, %err, "failed to create storage.data_dir");
         return ExitCode::from(EXIT_CONFIG_ERROR);
     }
-    let data_dir = std::path::PathBuf::from(&cfg.storage.data_dir);
+    // Canonicalize once, here, so every path derived from `data_dir` downstream
+    // (Python build artifact/venv/source dirs in particular) is absolute. A
+    // relative `data_dir` (e.g. `--data-dir ./tmp/data`, exactly what the
+    // quickstart docs use) would otherwise propagate as relative into
+    // `crates/open-functions-core/src/build/python/host.rs`'s
+    // `verify_entry_point`, which spawns the venv's `python` via a relative
+    // path while also setting the child's `current_dir` to the (also
+    // relative) source dir -- `std::process::Command` resolves a relative
+    // program path against the *new* working directory in that combination,
+    // not the parent's, so the venv interpreter is looked up in the wrong
+    // place and the spawn fails with ENOENT. All existing tests construct
+    // `data_dir` from `tempfile::tempdir()`, which is always absolute, so
+    // this never surfaced there.
+    let data_dir = match std::fs::canonicalize(&cfg.storage.data_dir) {
+        Ok(dir) => dir,
+        Err(err) => {
+            tracing::error!(data_dir = %cfg.storage.data_dir, %err, "failed to canonicalize storage.data_dir");
+            return ExitCode::from(EXIT_CONFIG_ERROR);
+        }
+    };
     let db_path = data_dir.join("meta.redb");
     let store = match RedbStore::open(&db_path) {
         Ok(store) => Arc::new(store),
@@ -167,16 +187,29 @@ pub async fn run(cfg: AppConfig) -> ExitCode {
         _ => PythonInstaller::Auto,
     };
     let python_cache_root = data_dir.join("cache");
+    // A dedicated client, like `resolve_image_digest`'s own -- cheap and
+    // infallible to construct (see `docker::connect`'s doc comments), kept
+    // separate from `container_driver`'s internal client so this module
+    // doesn't need to downcast the trait object to reach it.
+    let python_container_builder = match docker::connect(&cfg.runtime.docker_socket) {
+        Ok(client) => Some(Arc::new(ContainerPythonBuilder { docker: client })
+            as Arc<dyn open_functions_core::build::python::PythonBuilder>),
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                "failed to construct the Docker client for Python container-mode support; \
+                 python.mode = container/auto will fall back to Unsupported/host"
+            );
+            None
+        }
+    };
     let python = PythonSettings {
         mode: python_mode,
         host_builder: Arc::new(HostPythonBuilder {
             python_bin_override: cfg.python.python_bin.clone(),
             uv_bin: cfg.python.uv_bin.clone(),
         }),
-        // Wired in by T034/T035 once `ContainerPythonBuilder` exists;
-        // `python.mode = container`/`auto` fall back to `Unsupported`/`host`
-        // respectively until then (`select_python_builder`'s own doc comment).
-        container_builder: None,
+        container_builder: python_container_builder,
         installer: python_installer,
         python_bin: cfg.python.python_bin.clone(),
         uv_bin: cfg.python.uv_bin.clone(),

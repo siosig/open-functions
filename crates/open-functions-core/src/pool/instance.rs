@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 
+use crate::model::runtime::RuntimeLabel;
 use crate::runtime::{Driver, DriverError, InstanceHandle, InstanceSpec};
 
 /// What to do with a request that arrives once every instance is at its
@@ -140,6 +141,15 @@ pub struct InstancePool {
     /// `driver.kind()`, captured once at construction since a pool's driver
     /// never changes over its lifetime.
     driver_kind: &'static str,
+    /// `runtime` label for every metric this pool emits (002-python-runtime
+    /// T051, ops-config.md's 002 delta): captured once from the initial
+    /// `spec_template.runtime_label` at construction, mirroring
+    /// `driver_kind`'s same "fixed for this pool's lifetime" treatment -- a
+    /// function switching Rust/Python/image across a redeploy is not a
+    /// scenario this project's coexistence story targets, so a brief
+    /// staleness across that specific edge case is an acceptable trade-off
+    /// for not threading this through every mutex-guarded call site.
+    runtime_label: RuntimeLabel,
     driver: Arc<dyn Driver>,
     config: PoolConfig,
     inner: Mutex<PoolState>,
@@ -186,6 +196,7 @@ impl InstancePool {
         Self {
             function_name,
             driver_kind: driver.kind(),
+            runtime_label: spec_template.runtime_label,
             driver,
             config,
             global_limit: global_instance_limit,
@@ -340,7 +351,7 @@ impl InstancePool {
             removed
         };
         if let Some(mut inst) = removed {
-            metrics::counter!("open_functions_instance_crashes_total", "function" => self.function_name.clone())
+            metrics::counter!("open_functions_instance_crashes_total", "function" => self.function_name.clone(), "runtime" => self.runtime_label.as_str())
                 .increment(1);
             if let Some(handle) = inst.handle.take() {
                 // Drive the handle to completion in the background so this
@@ -367,6 +378,7 @@ impl InstancePool {
             "open_functions_instances",
             "function" => self.function_name.clone(),
             "state" => "ready",
+            "runtime" => self.runtime_label.as_str(),
         )
         .set(count as f64);
     }
@@ -508,9 +520,9 @@ impl InstancePool {
 
         let outcome = match result {
             Ok(handle) => {
-                metrics::counter!("open_functions_instance_starts_total", "function" => self.function_name.clone(), "result" => "ok")
+                metrics::counter!("open_functions_instance_starts_total", "function" => self.function_name.clone(), "result" => "ok", "runtime" => self.runtime_label.as_str())
                     .increment(1);
-                metrics::histogram!("open_functions_cold_start_seconds", "function" => self.function_name.clone(), "driver" => self.driver_kind)
+                metrics::histogram!("open_functions_cold_start_seconds", "function" => self.function_name.clone(), "driver" => self.driver_kind, "runtime" => self.runtime_label.as_str())
                     .record(spawn_start.elapsed().as_secs_f64());
                 let addr = handle.addr;
                 state.instances.insert(
@@ -526,7 +538,7 @@ impl InstancePool {
                 Ok(())
             }
             Err(e) => {
-                metrics::counter!("open_functions_instance_starts_total", "function" => self.function_name.clone(), "result" => "fail")
+                metrics::counter!("open_functions_instance_starts_total", "function" => self.function_name.clone(), "result" => "fail", "runtime" => self.runtime_label.as_str())
                     .increment(1);
                 // `permit` drops here (falls out of scope unstored),
                 // releasing the global slot back for someone else.

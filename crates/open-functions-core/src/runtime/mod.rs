@@ -15,6 +15,8 @@ pub mod readiness;
 
 pub use launch::Launch;
 
+use crate::model::runtime::RuntimeLabel;
+
 /// Everything a [`Driver`] needs to start one function instance.
 #[derive(Debug, Clone)]
 pub struct InstanceSpec {
@@ -34,6 +36,14 @@ pub struct InstanceSpec {
     /// covered Rust source-mode and image-mode; see [`Launch`]'s own doc
     /// comment for why Python needed a strictly more general shape.
     pub launch: Launch,
+    /// `rust` | `python314` | `image` (002-python-runtime T051): the
+    /// `runtime` metrics label every `InstancePool`-emitted metric carries
+    /// (`open_functions_instances`, `..._instance_starts_total`,
+    /// `..._instance_crashes_total`, `..._cold_start_seconds`), per
+    /// ops-config.md's 002 delta. Computed once by the caller (`RuntimeLabel::
+    /// from_declared`) when building this spec -- `InstancePool` itself has
+    /// no other way to know a `Function`'s declared runtime.
+    pub runtime_label: RuntimeLabel,
 }
 
 /// A running function instance, however it was started.

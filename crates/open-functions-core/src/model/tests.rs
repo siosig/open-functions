@@ -373,6 +373,27 @@ fn reserved_env_names_include_python_specific_keys_for_every_runtime() {
     }
 }
 
+#[test]
+fn image_mode_with_declared_python314_runtime_skips_python_specific_validation() {
+    // data-model.md's "validation rules (delta)" section: image-mode's
+    // `runtime` is a display-only hint, never validated -- an entry_point
+    // shape that would
+    // be rejected for a Python *source*-mode function (hyphenated, not a
+    // valid identifier) must still be accepted for an image-mode one, since
+    // FUNCTION_TARGET there is passed straight to whatever the container
+    // image itself expects.
+    let mut f = valid_function();
+    f.runtime = Some(Runtime::Python314);
+    f.source = Source::Image {
+        image_ref: "ghcr.io/me/hello-python:1.0".to_string(),
+    };
+    f.entry_point = "not-a-python-identifier".to_string();
+    assert!(
+        validate_function(&f).is_ok(),
+        "image-mode must not validate runtime = python314's entry_point shape"
+    );
+}
+
 // ---- property tests ----
 
 proptest! {

@@ -38,6 +38,13 @@ triggers).
 [`axum`]: https://docs.rs/axum
 [`CloudEvent`]: https://docs.rs/open-functions-sdk/latest/open_functions_sdk/type.CloudEvent.html
 
+This crate is Rust-only. `open-functions` also builds and runs Python 3.14
+functions, but those are written against the official
+[`functions-framework`](https://pypi.org/project/functions-framework/)
+package (the same one Cloud Run functions itself uses) rather than this
+SDK — see the workspace root [`README.md`](../../README.md#python-314-functions)'s
+"Python 3.14 functions" section.
+
 ## Writing an HTTP function
 
 ```rust

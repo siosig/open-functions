@@ -141,6 +141,24 @@ async fn management_lifecycle() {
         );
     }
 
+    // `GET /readyz`'s `functions` count must reflect the registry, not a
+    // hardcoded stub (regression: it used to always report 0 regardless of
+    // how many functions were actually registered -- see admin-api.md's
+    // `{"status":"ready","functions":N,"bindings_pending":M}` contract).
+    let readyz: Value = client
+        .get(format!("{}/readyz", server.admin_url))
+        .send()
+        .await
+        .expect("readyz")
+        .json()
+        .await
+        .expect("readyz JSON");
+    assert_eq!(readyz["functions"], 3, "readyz functions count: {readyz:?}");
+    assert_eq!(
+        readyz["bindings_pending"], 0,
+        "no pubsub-triggered functions were deployed: {readyz:?}"
+    );
+
     // `GET /v1/functions/{name}` field consistency.
     let describe: Value = client
         .get(format!("{}/v1/functions/mgmt-a", server.admin_url))

@@ -43,6 +43,13 @@ false
 {{ toml_section('build', {
   'mode': open_functions_build_mode,
 }) }}
+{{ toml_section('python', {
+  'mode': open_functions_python_mode,
+  'python_bin': open_functions_python_bin,
+  'installer': open_functions_python_installer,
+  'container_image': open_functions_python_container_image,
+  'functions_framework': open_functions_python_functions_framework,
+}) }}
 {{ toml_section('runtime', {
   'cgroup': open_functions_runtime_cgroup,
   'docker_network': open_functions_docker_network,
@@ -61,7 +68,7 @@ false
 {{ toml_section('metrics', {
   'enabled': true,
 }) }}
-{% set known_sections = ['invoke', 'admin', 'storage', 'build', 'runtime', 'defaults', 'pubsub', 'log', 'metrics'] %}
+{% set known_sections = ['invoke', 'admin', 'storage', 'build', 'python', 'runtime', 'defaults', 'pubsub', 'log', 'metrics'] %}
 {% for name, section in open_functions_extra_config.items() %}
 {% if name not in known_sections %}
 {{ toml_section(name, {}) }}
