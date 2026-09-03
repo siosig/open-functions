@@ -159,7 +159,12 @@ enum BeginStart {
     /// `global_limit`.
     Proceed {
         permit: OwnedSemaphorePermit,
-        spec: InstanceSpec,
+        // Boxed (002-python-runtime): `InstanceSpec` grew past clippy's
+        // `large_enum_variant` threshold once `Launch::Container` gained
+        // Python's `binds`/`cmd`/`working_dir` fields, which would otherwise
+        // size every `BeginStart` (including the 8-byte `WaitForOther` case)
+        // up to match.
+        spec: Box<InstanceSpec>,
     },
     /// Someone else is already starting one; wait on this `Notify` (bounded,
     /// since `Notify::notify_waiters` can race a late subscriber — see
@@ -482,7 +487,7 @@ impl InstancePool {
         state.starting = Some(notify);
         BeginStart::Proceed {
             permit,
-            spec: state.spec_template.clone(),
+            spec: Box::new(state.spec_template.clone()),
         }
     }
 
@@ -493,7 +498,7 @@ impl InstancePool {
     async fn finish_start(
         &self,
         permit: OwnedSemaphorePermit,
-        spec: InstanceSpec,
+        spec: Box<InstanceSpec>,
     ) -> Result<(), DriverError> {
         let spawn_start = Instant::now();
         let result = self.driver.spawn(&spec).await;

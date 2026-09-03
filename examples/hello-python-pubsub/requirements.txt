@@ -1,0 +1,5 @@
+# functions-framework is deliberately pinned here (the opposite of
+# examples/hello-python-http's requirements.txt): this proves that when the
+# user already declares functions-framework, the host does NOT rewrite or
+# duplicate it (see contracts/python-function-contract.md, FR-104).
+functions-framework==3.10.2

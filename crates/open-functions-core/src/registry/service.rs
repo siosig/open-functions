@@ -20,13 +20,14 @@
 //! contract's stricter "explicit mode unavailable → refuse to start at all"
 //! behavior belongs to the `open-functions` binary's own config validation, not here.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{Mutex, Semaphore};
 
+use crate::build::python::{Installer as PythonInstaller, PythonBuildRequest, PythonBuilder};
 use crate::build::{BuildError, BuildRequest, Builder};
 use crate::logs::ring::LogStore;
 use crate::model::TriggerBinding;
@@ -35,12 +36,14 @@ use crate::model::function::{
     Function, FunctionState, QueuePolicy as ModelQueuePolicy, Source, Trigger,
 };
 use crate::model::revision::Revision;
+use crate::model::runtime::{Runtime, detect_runtime};
 use crate::model::validate::{self, ValidationError};
 use crate::pool::{InstancePool, PoolConfig, QueuePolicy as PoolQueuePolicy};
 use crate::pubsub::reconcile::{DesiredBinding, Reconciler};
 use crate::registry::store::{Store, StoreError};
 use crate::runtime::docker::{self as docker_helper};
-use crate::runtime::{Driver, InstanceSpec};
+use crate::runtime::launch::{CONTAINER_ARTIFACT_DIR, PythonLaunchMode, python_instance_env};
+use crate::runtime::{Driver, InstanceSpec, Launch};
 
 /// `build.mode` (`ops-config.md`'s `[build]` section): which `Builder`
 /// source-mode registrations use. Image-mode registrations ignore this
@@ -54,6 +57,51 @@ pub enum BuildModeSetting {
     Host,
     /// Always `container_builder`; reject with 412 if Docker isn't reachable.
     Container,
+}
+
+/// `python.mode` (`ops-config.md`'s `[python]` section): which `PythonBuilder`
+/// Python source-mode registrations use. Mirrors [`BuildModeSetting`]'s
+/// shape for the Rust pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PythonModeSetting {
+    /// Prefer `host_builder`; fall back to `container_builder` (once T034/T035
+    /// wire one in) if no usable Python 3.14 interpreter is found; reject
+    /// with 412 if neither is available.
+    Auto,
+    /// Always `host_builder`; reject with 412 if no usable Python 3.14
+    /// interpreter is found.
+    Host,
+    /// Always `container_builder`; reject with 412 if none is configured or
+    /// its Docker daemon isn't reachable.
+    Container,
+}
+
+/// Everything a Python source-mode registration needs beyond what
+/// [`RegistryService`] already carries for Rust: which builder(s) to use,
+/// the config values every [`PythonBuildRequest`] is assembled from, and the
+/// once-computed install-step env passthrough (`env::passthrough_env`,
+/// depends only on the host's own process env and `cache_root`, both fixed
+/// for the life of the process).
+pub struct PythonSettings {
+    pub mode: PythonModeSetting,
+    pub host_builder: Arc<dyn PythonBuilder>,
+    /// `None` until a `ContainerPythonBuilder` is wired in (T034/T035) --
+    /// `python.mode = container`/`auto` then behave as if no container
+    /// builder is configured at all.
+    pub container_builder: Option<Arc<dyn PythonBuilder>>,
+    pub installer: PythonInstaller,
+    /// `python.python_bin`; empty means autodetect (`HostPythonBuilder`'s
+    /// own `python3.14` -> `python3` -> `python` search).
+    pub python_bin: String,
+    pub uv_bin: String,
+    /// `python.container_image`, recorded on `Revision.container_image` for
+    /// container-mode builds and passed to `ContainerPythonBuilder`.
+    pub container_image: String,
+    /// `python.functions_framework`, e.g. `"functions-framework==3.10.2"`.
+    pub functions_framework_spec: String,
+    /// `<data_dir>/cache`, the parent of the `uv/`/`pip/` cache subdirectories.
+    pub cache_root: PathBuf,
+    pub passthrough_env: BTreeMap<String, String>,
 }
 
 /// Pub/Sub-binding configuration, present only when `pubsub.enabled` (the
@@ -92,6 +140,12 @@ pub struct RegisterRequest {
     pub name: String,
     pub trigger: Trigger,
     pub source: Source,
+    /// Explicit runtime override (002-python-runtime). `None` means
+    /// auto-detect from `source` when it's `Source::Dir` (see
+    /// `model::detect_runtime`); for `Source::Image` it's stored as-is
+    /// (display hint only, not validated -- the image-mode contract is
+    /// language-agnostic).
+    pub runtime: Option<Runtime>,
     pub entry_point: Option<String>,
     pub env: std::collections::BTreeMap<String, String>,
     pub timeout_secs: Option<u32>,
@@ -112,14 +166,24 @@ pub enum RegisterError {
     Store(#[from] StoreError),
     /// A `412 FAILED_PRECONDITION` in `admin.rs`'s mapping: the requested
     /// registration (source or image mode) can't be fulfilled by anything
-    /// currently available (build tool / Docker daemon), per ops-config.md's
-    /// "Validation and startup failure" table.
-    #[error("precondition not met: {0}")]
-    Unsupported(String),
+    /// currently available (build tool / Docker daemon / Python
+    /// interpreter), per ops-config.md's "Validation and startup failure"
+    /// table. `needed` lists the missing tool name(s) (e.g. `["python3.14"]`,
+    /// `["python3.14", "docker"]`), surfaced verbatim as `admin.rs`'s
+    /// `details.needed` (quickstart.md's own example of this shape).
+    #[error("precondition not met: {reason}")]
+    Unsupported { reason: String, needed: Vec<String> },
     #[error("a build for {0:?} is already in progress; retry, or pass force to cancel it")]
     BuildInProgress(String),
     #[error("source path {0:?} does not exist or is not a directory")]
     SourceNotFound(PathBuf),
+    /// A `400 INVALID_ARGUMENT`: the declared (or auto-detected) `runtime`
+    /// doesn't match the source directory's actual contents -- an explicit
+    /// `runtime = rust` with no `Cargo.toml`, an explicit `runtime =
+    /// python314` with no `main.py`, both present with neither declared
+    /// (ambiguous), or neither present (nothing detected).
+    #[error("{0}")]
+    InvalidRuntime(String),
 }
 
 /// Result of `register`: the build has been accepted and started in the
@@ -184,6 +248,7 @@ pub struct RegistryService {
     /// binding management entirely for `Trigger::Pubsub` functions (they
     /// still register and build normally, they just never receive events).
     pubsub: Option<PubsubBindingConfig>,
+    python: PythonSettings,
     /// Per-function log ring buffers (T079/US5), shared with `process_driver`/
     /// `container_driver` (both drain their instances' output into it) and
     /// exposed read-only to `open-functions`'s `admin.rs` `GET .../logs` (T081) via
@@ -207,6 +272,7 @@ impl RegistryService {
         defaults: RegistrationDefaults,
         pubsub: Option<PubsubBindingConfig>,
         log_store: Arc<LogStore>,
+        python: PythonSettings,
     ) -> Self {
         Self {
             store,
@@ -227,6 +293,7 @@ impl RegistryService {
             building: Mutex::new(std::collections::HashSet::new()),
             pubsub,
             log_store,
+            python,
         }
     }
 
@@ -255,6 +322,39 @@ impl RegistryService {
 
     pub fn get_build(&self, id: &str) -> Result<Option<Build>, StoreError> {
         self.store.get_build(id)
+    }
+
+    /// Every `Build` recorded for `name`, in whatever order the store
+    /// yields (`admin.rs`'s `revisions[]`/`builds[]` describe fields sort
+    /// afterward). No dedicated per-function index exists (`Store` has no
+    /// `list_builds_for`), so this filters `list_builds()`'s full result --
+    /// acceptable for a local dev tool's admin API, not a hot path.
+    pub fn list_builds_for(&self, name: &str) -> Result<Vec<Build>, StoreError> {
+        Ok(self
+            .store
+            .list_builds()?
+            .into_iter()
+            .filter(|b| b.function_name == name)
+            .collect())
+    }
+
+    /// Every `Revision` recorded for `name`, from `1` through its current
+    /// `current_revision` (inclusive) -- `Store` only exposes `get_revision`
+    /// per-number, not a per-function list, so this reconstructs the
+    /// sequence from the numbering scheme `register_source_rust`/
+    /// `register_source_python`/`register_image` all share (revisions are
+    /// always `existing.current_revision.unwrap_or(0) + 1`, so every number
+    /// from `1` to the latest was allocated at some point). A number with no
+    /// stored `Revision` (a build that failed before ever producing one) is
+    /// simply skipped.
+    pub fn list_revisions_for(&self, name: &str, up_to: u32) -> Result<Vec<Revision>, StoreError> {
+        let mut revisions = Vec::new();
+        for number in 1..=up_to {
+            if let Some(revision) = self.store.get_revision(name, number)? {
+                revisions.push(revision);
+            }
+        }
+        Ok(revisions)
     }
 
     pub fn get_binding(&self, name: &str) -> Result<Option<TriggerBinding>, StoreError> {
@@ -341,6 +441,11 @@ impl RegistryService {
             name: req.name.clone(),
             trigger: req.trigger.clone(),
             source: req.source.clone(),
+            // `req.runtime` is the caller's explicit override (if any) --
+            // auto-detection for `Source::Dir` (model::detect_runtime) is
+            // resolved by the caller before building this request, so by
+            // the time we get here it's already the final value.
+            runtime: req.runtime,
             env: req.env.clone(),
             entry_point: req
                 .entry_point
@@ -385,19 +490,22 @@ impl RegistryService {
                 if self.host_builder.is_available().await {
                     Ok((&self.host_builder, BuildMode::Host))
                 } else {
-                    Err(RegisterError::Unsupported(
-                        "build.mode = host but the host cargo toolchain is not available"
+                    Err(RegisterError::Unsupported {
+                        reason: "build.mode = host but the host cargo toolchain is not available"
                             .to_string(),
-                    ))
+                        needed: vec!["cargo".to_string()],
+                    })
                 }
             }
             BuildModeSetting::Container => {
                 if self.container_builder.is_available().await {
                     Ok((&self.container_builder, BuildMode::Container))
                 } else {
-                    Err(RegisterError::Unsupported(
-                        "build.mode = container but the Docker daemon is not reachable".to_string(),
-                    ))
+                    Err(RegisterError::Unsupported {
+                        reason: "build.mode = container but the Docker daemon is not reachable"
+                            .to_string(),
+                        needed: vec!["docker".to_string()],
+                    })
                 }
             }
             BuildModeSetting::Auto => {
@@ -406,17 +514,283 @@ impl RegistryService {
                 } else if self.container_builder.is_available().await {
                     Ok((&self.container_builder, BuildMode::Container))
                 } else {
-                    Err(RegisterError::Unsupported(
-                        "build.mode = auto but neither the host cargo toolchain nor the Docker \
-                         daemon is available"
+                    Err(RegisterError::Unsupported {
+                        reason: "build.mode = auto but neither the host cargo toolchain nor the \
+                         Docker daemon is available"
                             .to_string(),
-                    ))
+                        needed: vec!["cargo".to_string(), "docker".to_string()],
+                    })
                 }
             }
         }
     }
 
+    /// Resolves and dispatches a `Source::Dir` registration to the
+    /// runtime-appropriate flow (002-python-runtime T029): determines
+    /// `Runtime` (explicit `req.runtime`, checked for consistency against
+    /// the directory's actual contents, or auto-detected via
+    /// `model::detect_runtime` when unset), stamps it onto `req.runtime` so
+    /// every downstream record (`Function.runtime`, metrics labels) sees the
+    /// resolved value rather than a possibly-`None` caller-supplied one, then
+    /// calls `register_source_rust` or `register_source_python`.
     async fn register_source(
+        &self,
+        mut req: RegisterRequest,
+        source_path: PathBuf,
+        bin: Option<String>,
+    ) -> Result<RegisterAccepted, RegisterError> {
+        let runtime = self.resolve_dir_runtime(&req, &source_path)?;
+        req.runtime = Some(runtime);
+        match runtime {
+            Runtime::Rust => self.register_source_rust(req, source_path, bin).await,
+            Runtime::Python314 => self.register_source_python(req, source_path).await,
+        }
+    }
+
+    /// data-model.md's "Validation rules (diff)": an explicit `runtime = rust`
+    /// requires `Cargo.toml`, an explicit `runtime = python314` requires
+    /// `main.py`; with no explicit `runtime`, `model::detect_runtime` picks
+    /// one from whichever of the two is present (ambiguous/neither present
+    /// are both rejected there too). Every path yields `RegisterError::
+    /// InvalidRuntime` (400 `INVALID_ARGUMENT`) on mismatch, never a build
+    /// failure -- this check runs before any build is attempted.
+    fn resolve_dir_runtime(
+        &self,
+        req: &RegisterRequest,
+        source_path: &Path,
+    ) -> Result<Runtime, RegisterError> {
+        match req.runtime {
+            Some(Runtime::Rust) => {
+                if source_path.join("Cargo.toml").is_file() {
+                    Ok(Runtime::Rust)
+                } else {
+                    Err(RegisterError::InvalidRuntime(format!(
+                        "runtime = rust requires a Cargo.toml in {}",
+                        source_path.display()
+                    )))
+                }
+            }
+            Some(Runtime::Python314) => {
+                if source_path.join("main.py").is_file() {
+                    Ok(Runtime::Python314)
+                } else {
+                    Err(RegisterError::InvalidRuntime(format!(
+                        "runtime = python314 requires a main.py in {}",
+                        source_path.display()
+                    )))
+                }
+            }
+            None => detect_runtime(source_path)
+                .map_err(|err| RegisterError::InvalidRuntime(err.to_string())),
+        }
+    }
+
+    /// Picks the `PythonBuilder` for a Python source-mode registration per
+    /// `python.mode`, mirroring `select_source_builder`'s shape for the Rust
+    /// pipeline. `Container` currently always fails (`container_builder` is
+    /// `None` until T034/T035 wire a `ContainerPythonBuilder` in); `Auto`
+    /// therefore behaves like `Host` until then.
+    async fn select_python_builder(
+        &self,
+    ) -> Result<(&Arc<dyn PythonBuilder>, BuildMode), RegisterError> {
+        match self.python.mode {
+            PythonModeSetting::Host => {
+                if self.python.host_builder.is_available().await {
+                    Ok((&self.python.host_builder, BuildMode::Host))
+                } else {
+                    Err(RegisterError::Unsupported {
+                        reason: "python.mode = host but no usable Python 3.14 interpreter was \
+                         found"
+                            .to_string(),
+                        needed: vec!["python3.14".to_string()],
+                    })
+                }
+            }
+            PythonModeSetting::Container => match &self.python.container_builder {
+                Some(builder) if builder.is_available().await => {
+                    Ok((builder, BuildMode::Container))
+                }
+                _ => Err(RegisterError::Unsupported {
+                    reason: "python.mode = container but no container Python builder is \
+                     available"
+                        .to_string(),
+                    needed: vec!["docker".to_string()],
+                }),
+            },
+            PythonModeSetting::Auto => {
+                if self.python.host_builder.is_available().await {
+                    Ok((&self.python.host_builder, BuildMode::Host))
+                } else if let Some(builder) = &self.python.container_builder
+                    && builder.is_available().await
+                {
+                    Ok((builder, BuildMode::Container))
+                } else {
+                    Err(RegisterError::Unsupported {
+                        reason: "python.mode = auto but no usable Python 3.14 interpreter or \
+                         container Python builder is available"
+                            .to_string(),
+                        needed: vec!["python3.14".to_string(), "docker".to_string()],
+                    })
+                }
+            }
+        }
+    }
+
+    async fn register_source_python(
+        &self,
+        req: RegisterRequest,
+        source_path: PathBuf,
+    ) -> Result<RegisterAccepted, RegisterError> {
+        let (builder, build_mode) = self.select_python_builder().await?;
+
+        let existing = self.store.get_function(&req.name)?;
+        let revision_number = existing
+            .as_ref()
+            .and_then(|f| f.current_revision)
+            .unwrap_or(0)
+            + 1;
+
+        let function = self.build_function_record(&req, existing.as_ref());
+        validate::validate_function(&function)?;
+        self.store.put_function(&function)?;
+        self.report_function_state_gauge();
+
+        if let Trigger::Pubsub { topic } = &function.trigger {
+            self.bind_pubsub_trigger(&function.name, topic, function.timeout_secs)
+                .await;
+        }
+
+        let build_id = uuid::Uuid::new_v4().simple().to_string();
+        let artifact_dir = self
+            .artifacts_dir
+            .join(&req.name)
+            .join(revision_number.to_string());
+        let log_path = artifact_dir.join("build.log");
+
+        let build = Build {
+            id: build_id.clone(),
+            function_name: req.name.clone(),
+            revision: revision_number,
+            mode: build_mode,
+            status: BuildStatus::Running,
+            log_path: log_path.to_string_lossy().to_string(),
+            exit_code: None,
+            started_at: function.created_at.max(function.updated_at),
+            finished_at: None,
+            // Not known until the build finishes (uv vs pip) -- filled in below.
+            tool: None,
+        };
+        self.store.put_build(&build)?;
+
+        let python_bin = if self.python.python_bin.is_empty() {
+            None
+        } else {
+            Some(self.python.python_bin.clone())
+        };
+        let build_request = PythonBuildRequest {
+            function_name: req.name.clone(),
+            revision: revision_number,
+            source_dir: source_path,
+            artifact_dir: artifact_dir.clone(),
+            entry_point: function.entry_point.clone(),
+            timeout: self.build_timeout,
+            cache_root: self.python.cache_root.clone(),
+            functions_framework_spec: self.python.functions_framework_spec.clone(),
+            installer: self.python.installer,
+            python_bin,
+            uv_bin: self.python.uv_bin.clone(),
+            container_image: self.python.container_image.clone(),
+            passthrough_env: self.python.passthrough_env.clone(),
+        };
+
+        let build_started = std::time::Instant::now();
+        let build_outcome = builder.build(&build_request).await;
+        let build_mode_label: &'static str = match build_mode {
+            BuildMode::Host => "host",
+            BuildMode::Container => "container",
+        };
+        metrics::histogram!("open_functions_build_duration_seconds", "mode" => build_mode_label)
+            .record(build_started.elapsed().as_secs_f64());
+
+        let mut build_record = build;
+        build_record.finished_at = Some(chrono::Utc::now());
+        let (function_state, last_error, revision_ready, tool) = match &build_outcome {
+            Ok(outcome) => {
+                metrics::counter!(
+                    "open_functions_builds_total",
+                    "function" => req.name.clone(), "mode" => build_mode_label, "result" => "ok",
+                )
+                .increment(1);
+                build_record.status = BuildStatus::Succeeded;
+                build_record.exit_code = Some(0);
+                (FunctionState::Ready, None, true, Some(outcome.tool.clone()))
+            }
+            Err(err) => {
+                metrics::counter!(
+                    "open_functions_builds_total",
+                    "function" => req.name.clone(), "mode" => build_mode_label, "result" => "fail",
+                )
+                .increment(1);
+                build_record.status = BuildStatus::Failed;
+                build_record.exit_code = None;
+                // Per FR-007: a failed re-deploy leaves the prior `ready`
+                // revision serving, if there was one.
+                let state = if existing
+                    .as_ref()
+                    .is_some_and(|f| f.state == FunctionState::Ready)
+                {
+                    FunctionState::Ready
+                } else {
+                    FunctionState::Failed
+                };
+                (state, Some(err.to_string()), false, None)
+            }
+        };
+        build_record.tool = tool;
+        self.store.put_build(&build_record)?;
+
+        if revision_ready {
+            let snapshot = {
+                let mut snap = function.clone();
+                snap.state = FunctionState::Ready;
+                snap.current_revision = Some(revision_number);
+                snap
+            };
+            let revision = Revision {
+                function_name: req.name.clone(),
+                number: revision_number,
+                artifact_path: Some(artifact_dir.to_string_lossy().to_string()),
+                image_digest: None,
+                build_id: Some(build_id.clone()),
+                snapshot,
+                build_mode: Some(build_mode),
+                container_image: if build_mode == BuildMode::Container {
+                    Some(self.python.container_image.clone())
+                } else {
+                    None
+                },
+                artifact_pruned: false,
+                created_at: chrono::Utc::now(),
+            };
+            self.store.put_revision(&revision)?;
+
+            self.activate_revision(&req.name, &revision).await?;
+        } else {
+            let mut updated = function.clone();
+            updated.state = function_state;
+            updated.last_error = last_error;
+            updated.updated_at = chrono::Utc::now();
+            self.store.put_function(&updated)?;
+            self.report_function_state_gauge();
+        }
+
+        Ok(RegisterAccepted {
+            revision: revision_number,
+            build_id,
+        })
+    }
+
+    async fn register_source_rust(
         &self,
         req: RegisterRequest,
         source_path: PathBuf,
@@ -465,6 +839,9 @@ impl RegistryService {
             exit_code: None,
             started_at: function.created_at.max(function.updated_at),
             finished_at: None,
+            // This is the Rust source-mode path (register_source_rust); Python's
+            // uv/pip tool is recorded by register_source_python instead.
+            tool: Some("cargo".to_string()),
         };
         self.store.put_build(&build)?;
 
@@ -542,6 +919,9 @@ impl RegistryService {
                 image_digest: None,
                 build_id: Some(build_id.clone()),
                 snapshot,
+                build_mode: Some(build_mode),
+                container_image: None,
+                artifact_pruned: false,
                 created_at: chrono::Utc::now(),
             };
             self.store.put_revision(&revision)?;
@@ -577,16 +957,24 @@ impl RegistryService {
         image_ref: String,
     ) -> Result<RegisterAccepted, RegisterError> {
         if !self.container_driver.is_available().await {
-            return Err(RegisterError::Unsupported(
-                "source.kind = image but the Docker daemon is not reachable".to_string(),
-            ));
+            return Err(RegisterError::Unsupported {
+                reason: "source.kind = image but the Docker daemon is not reachable".to_string(),
+                needed: vec!["docker".to_string()],
+            });
         }
 
-        let docker = docker_helper::connect(&self.docker_socket)
-            .map_err(|err| RegisterError::Unsupported(err.to_string()))?;
+        let docker = docker_helper::connect(&self.docker_socket).map_err(|err| {
+            RegisterError::Unsupported {
+                reason: err.to_string(),
+                needed: vec!["docker".to_string()],
+            }
+        })?;
         let digest = resolve_image_digest(&docker, &image_ref)
             .await
-            .map_err(RegisterError::Unsupported)?;
+            .map_err(|reason| RegisterError::Unsupported {
+                reason,
+                needed: vec!["docker".to_string()],
+            })?;
 
         let existing = self.store.get_function(&req.name)?;
         let revision_number = existing
@@ -614,6 +1002,9 @@ impl RegistryService {
             image_digest: Some(digest),
             build_id: None,
             snapshot: function,
+            build_mode: None,
+            container_image: None,
+            artifact_pruned: false,
             created_at: chrono::Utc::now(),
         };
         self.store.put_revision(&revision)?;
@@ -642,14 +1033,58 @@ impl RegistryService {
             .clone()
             .map(PathBuf::from)
             .unwrap_or_default();
-        // Image-mode (US4) instances run via `container_driver` and carry
-        // `image_ref` (ignoring `artifact_path`); source-mode instances run
-        // via `process_driver` and carry `artifact_path` (ignoring
-        // `image_ref`, left `None`) -- the two are mutually exclusive per
-        // `Source`'s own variants, so this single match covers both.
-        let (driver, image_ref): (&Arc<dyn Driver>, Option<String>) = match &f.source {
-            Source::Image { image_ref } => (&self.container_driver, Some(image_ref.clone())),
-            Source::Dir { .. } => (&self.process_driver, None),
+        // Image-mode instances run via `container_driver` and carry
+        // `Launch::image` (ignoring `artifact_path`). Source-mode instances
+        // branch further on `Function.runtime` × `Revision.build_mode`:
+        // Rust (or no declared runtime, a pre-002 record) runs via
+        // `process_driver`/`Launch::rust_process`; Python runs via
+        // `process_driver`/`Launch::python_host` (host build) or
+        // `container_driver`/`Launch::python_container` (container build,
+        // T034/T035). `python_instance_env`'s defaults are layered under
+        // the function's own declared `env` (last write wins, matching that
+        // function's own doc comment) -- Rust/image-mode instances get no
+        // such defaults, just `f.env` as-is, unchanged from before 002.
+        let (driver, launch, env): (
+            &Arc<dyn Driver>,
+            Launch,
+            std::collections::BTreeMap<String, String>,
+        ) = match (&f.source, f.runtime) {
+            (Source::Image { image_ref }, _) => (
+                &self.container_driver,
+                Launch::image(image_ref.clone()),
+                f.env.clone(),
+            ),
+            (Source::Dir { .. }, Some(Runtime::Python314)) => match revision.build_mode {
+                Some(BuildMode::Container) => {
+                    let image = revision
+                        .container_image
+                        .clone()
+                        .unwrap_or_else(|| self.python.container_image.clone());
+                    let venv_dir = PathBuf::from(CONTAINER_ARTIFACT_DIR).join("venv");
+                    let mut env = python_instance_env(f, PythonLaunchMode::Container, &venv_dir);
+                    env.extend(f.env.clone());
+                    (
+                        &self.container_driver,
+                        Launch::python_container(&artifact_path, image),
+                        env,
+                    )
+                }
+                _ => {
+                    let venv_dir = artifact_path.join("venv");
+                    let mut env = python_instance_env(f, PythonLaunchMode::Process, &venv_dir);
+                    env.extend(f.env.clone());
+                    (
+                        &self.process_driver,
+                        Launch::python_host(&artifact_path),
+                        env,
+                    )
+                }
+            },
+            (Source::Dir { .. }, _) => (
+                &self.process_driver,
+                Launch::rust_process(artifact_path),
+                f.env.clone(),
+            ),
         };
 
         let signature_type: &'static str = match &f.trigger {
@@ -662,11 +1097,10 @@ impl RegistryService {
             revision: revision.number,
             entry_point: f.entry_point.clone(),
             signature_type,
-            env: f.env.clone(),
+            env,
             memory_mib: f.memory_mib,
             start_timeout: Duration::from_secs(10),
-            artifact_path,
-            image_ref,
+            launch,
         };
 
         let pool_config = PoolConfig {
@@ -829,7 +1263,7 @@ impl RegistryService {
 
     /// Refreshes the `open_functions_functions{state}` gauge (T082/US5) from the
     /// store's current contents. Called after every state-changing
-    /// operation (`register_source`, `register_image`, `activate_revision`,
+    /// operation (`register_source_rust`, `register_image`, `activate_revision`,
     /// `delete`) rather than incrementally tracked, since the number of
     /// functions is always small enough that a full re-list is cheap and
     /// this avoids the gauge ever drifting out of sync with reality.

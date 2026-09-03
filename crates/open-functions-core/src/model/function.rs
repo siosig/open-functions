@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::runtime::Runtime;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FunctionState {
@@ -54,6 +56,14 @@ pub struct Function {
     pub name: String,
     pub trigger: Trigger,
     pub source: Source,
+    /// Which language `source` is written in (002-python-runtime). `None`
+    /// for records persisted before this field existed (restore backfills
+    /// `Some(Runtime::Rust)` for `Source::Dir` -- see registry::restore) or
+    /// for `Source::Image` registrations that declared no `runtime` (kept
+    /// only as a display hint there; the image-mode contract itself is
+    /// language-agnostic, see function-contract.md).
+    #[serde(default)]
+    pub runtime: Option<Runtime>,
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
     #[serde(default = "default_entry_point")]

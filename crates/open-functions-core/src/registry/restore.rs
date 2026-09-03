@@ -18,7 +18,8 @@
 //! bindings needs no separate action here.
 
 use crate::model::build::BuildStatus;
-use crate::model::function::FunctionState;
+use crate::model::function::{FunctionState, Source};
+use crate::model::runtime::Runtime;
 use crate::registry::service::RegistryService;
 use crate::registry::store::StoreError;
 
@@ -48,9 +49,29 @@ impl RegistryService {
     /// exactly once, right after `RegistryService::new`.
     pub async fn restore(&self) -> Result<RestoreReport, StoreError> {
         let mut report = RestoreReport::default();
+        self.backfill_runtime().await?;
         self.reconcile_interrupted_builds(&mut report).await?;
         self.restore_ready_function_pools(&mut report).await?;
         Ok(report)
+    }
+
+    /// Pre-002 records persisted before `Function.runtime` existed load with
+    /// `runtime: None` (`#[serde(default)]`). A `Source::Dir` record with no
+    /// `runtime` was always a Rust source build (Python didn't exist yet), so
+    /// backfill it to `Some(Runtime::Rust)` and persist — `data-model.md`'s
+    /// `runtime` field note. `Source::Image` records stay `None` (display-only
+    /// for images, no runtime to infer).
+    async fn backfill_runtime(&self) -> Result<(), StoreError> {
+        for mut function in self.store.list_functions()? {
+            if function.runtime.is_some() {
+                continue;
+            }
+            if matches!(function.source, Source::Dir { .. }) {
+                function.runtime = Some(Runtime::Rust);
+                self.store.put_function(&function)?;
+            }
+        }
+        Ok(())
     }
 
     async fn reconcile_interrupted_builds(

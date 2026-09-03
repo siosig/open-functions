@@ -16,6 +16,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v10
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -35,6 +39,8 @@ jobs:
       - run: cargo nextest run --workspace
         env:
           OPEN_FUNCTIONS_TEST_DOCKER: "1"
+      - run: docker build -t hello-python-http:ci examples/hello-python-http
+      - run: docker build -t hello-python-pubsub:ci examples/hello-python-pubsub
 
   ansible-lint:
     runs-on: ubuntu-latest

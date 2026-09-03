@@ -8,14 +8,26 @@
 
 use std::collections::BTreeMap;
 
-use super::function::{Function, Trigger};
+use super::function::{Function, Source, Trigger};
+use super::runtime::Runtime;
 
 /// Reserved environment variable name prefix that GCP/open-functions sets automatically
 /// (`K_SERVICE`, `K_REVISION`, `K_CONFIGURATION`, ...).
 const RESERVED_ENV_PREFIX: &str = "K_";
 
 /// Exact reserved environment variable names (data-model.md `env` constraints).
-const RESERVED_ENV_NAMES: [&str; 3] = ["PORT", "FUNCTION_TARGET", "FUNCTION_SIGNATURE_TYPE"];
+/// `HOST` / `FUNCTION_SOURCE` / `VIRTUAL_ENV` are reserved for every runtime
+/// (002-python-runtime data-model.md's Function validation-rule diff), not just
+/// Python functions, so a function can switch runtimes across a re-register
+/// without an env key that was fine before suddenly becoming reserved.
+const RESERVED_ENV_NAMES: [&str; 6] = [
+    "PORT",
+    "FUNCTION_TARGET",
+    "FUNCTION_SIGNATURE_TYPE",
+    "HOST",
+    "FUNCTION_SOURCE",
+    "VIRTUAL_ENV",
+];
 
 /// Maximum total serialized size (bytes) of all env values (data-model.md: 32 KiB).
 const ENV_VALUES_MAX_BYTES: usize = 32 * 1024;
@@ -79,6 +91,18 @@ pub enum ValidationError {
 
     #[error("min_instances ({min}) must not exceed max_instances ({max})")]
     MinExceedsMax { min: u32, max: u32 },
+
+    #[error(
+        "invalid entry_point {0:?} for runtime python314: must match ^[A-Za-z_][A-Za-z0-9_]*$ \
+         (a Python identifier)"
+    )]
+    InvalidPythonEntryPoint(String),
+
+    #[error(
+        "source.bin is not applicable to runtime python314 (bin target selection is a Rust/cargo \
+         concept; a Python source directory has a single main.py entry file)"
+    )]
+    BinNotApplicableToPython,
 }
 
 /// Validates a function name against `^[a-z][a-z0-9-]{0,62}$` and the `_cf` reserved prefix.
@@ -225,5 +249,33 @@ pub fn validate_function(f: &Function) -> Result<(), ValidationError> {
 
     validate_env(&f.env)?;
 
+    if f.runtime == Some(Runtime::Python314) {
+        validate_python_entry_point(&f.entry_point)?;
+        if let Source::Dir { bin: Some(_), .. } = &f.source {
+            return Err(ValidationError::BinNotApplicableToPython);
+        }
+    }
+
+    Ok(())
+}
+
+/// Validates a Python entry-point name against `^[A-Za-z_][A-Za-z0-9_]*$`
+/// (a valid Python identifier -- `FUNCTION_TARGET` is passed straight
+/// through to `functions-framework`, which imports it as an attribute of
+/// `main.py`, so anything else can never resolve).
+fn validate_python_entry_point(entry_point: &str) -> Result<(), ValidationError> {
+    let is_valid = entry_point
+        .as_bytes()
+        .first()
+        .is_some_and(|&b| b.is_ascii_alphabetic() || b == b'_')
+        && entry_point
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+
+    if !is_valid {
+        return Err(ValidationError::InvalidPythonEntryPoint(
+            entry_point.to_string(),
+        ));
+    }
     Ok(())
 }

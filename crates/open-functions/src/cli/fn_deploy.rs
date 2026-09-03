@@ -29,6 +29,12 @@ pub struct DeployArgs {
     trigger_topic: Option<String>,
     #[arg(long, default_value = "function")]
     entry_point: String,
+    /// Explicit runtime override for `--source` deploys: `rust` or
+    /// `python314`. Auto-detected from the source directory when omitted
+    /// (`Cargo.toml` -> rust, `main.py` -> python314). Mutually exclusive
+    /// with `--bin` (a cargo bin-target selector, meaningless for Python).
+    #[arg(long)]
+    runtime: Option<String>,
     #[arg(long = "set-env", value_parser = parse_env_pair)]
     set_env: Vec<(String, String)>,
     #[arg(long)]
@@ -68,6 +74,17 @@ pub fn run(client: &AdminClient, args: DeployArgs) -> ExitCode {
 }
 
 async fn run_async(client: &AdminClient, args: DeployArgs) -> ExitCode {
+    if args.runtime.is_some() && args.bin.is_some() {
+        eprintln!("error: --runtime and --bin are mutually exclusive");
+        return ExitCode::from(2);
+    }
+    if let Some(runtime) = &args.runtime
+        && !matches!(runtime.as_str(), "rust" | "python314")
+    {
+        eprintln!("error: --runtime must be \"rust\" or \"python314\", got {runtime:?}");
+        return ExitCode::from(2);
+    }
+
     let source = match build_source_json(&args) {
         Ok(source) => source,
         Err(code) => return code,
@@ -76,6 +93,9 @@ async fn run_async(client: &AdminClient, args: DeployArgs) -> ExitCode {
     let mut fields = serde_json::Map::new();
     fields.insert("trigger".into(), build_trigger_json(&args));
     fields.insert("source".into(), source);
+    if let Some(runtime) = &args.runtime {
+        fields.insert("runtime".into(), json!(runtime));
+    }
     fields.insert("entry_point".into(), json!(args.entry_point));
     fields.insert(
         "env".into(),

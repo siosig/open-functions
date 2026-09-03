@@ -1,6 +1,7 @@
 pub mod container;
 pub mod host_cargo;
 pub mod metadata;
+pub mod python;
 
 #[cfg(test)]
 mod tests;

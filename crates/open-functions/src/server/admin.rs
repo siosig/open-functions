@@ -16,6 +16,7 @@ use futures_util::StreamExt;
 use open_functions_core::logs::pipe::LogRecord;
 use open_functions_core::model::build::BuildStatus;
 use open_functions_core::model::function::{Function, Source, Trigger};
+use open_functions_core::model::runtime::Runtime;
 use open_functions_core::registry::service::{
     DeleteError, RegisterError, RegisterRequest, RegistryService, StopError,
 };
@@ -159,12 +160,38 @@ fn api_error(
     (status, Json(json!({"error": message.into(), "code": code}))).into_response()
 }
 
+/// Like [`api_error`], but with a `details` object attached (admin-api.md's
+/// error format: `{"error", "code", "details": {...}}`) -- used for
+/// `RegisterError::Unsupported`'s `details.needed` (quickstart.md's example:
+/// `{"needed": ["python3.14", "docker"]}`).
+fn api_error_with_details(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+    details: serde_json::Value,
+) -> axum::response::Response {
+    (
+        status,
+        Json(json!({"error": message.into(), "code": code, "details": details})),
+    )
+        .into_response()
+}
+
 /// `PUT /v1/functions/{name}` request body, per `contracts/admin-api.md`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeployRequest {
     trigger: TriggerDto,
     source: SourceDto,
+    /// Explicit runtime override (002-python-runtime, FR-101/FR-102):
+    /// `"rust"` | `"python314"`. `None` auto-detects from `source` when it's
+    /// `kind: "dir"` (see `model::detect_runtime`); ignored (display-only)
+    /// for `kind: "image"`. An unrecognized string is rejected by `Runtime`'s
+    /// own `Deserialize` impl before this handler ever runs, via axum's
+    /// standard `Json` extraction 400 (matches this struct's other strict
+    /// enum fields, `trigger`/`source`).
+    #[serde(default)]
+    runtime: Option<Runtime>,
     #[serde(default)]
     entry_point: Option<String>,
     #[serde(default)]
@@ -238,6 +265,7 @@ async fn register_function(
         name,
         trigger,
         source,
+        runtime: body.runtime,
         entry_point: body.entry_point,
         env: body.env,
         timeout_secs: body.timeout_secs,
@@ -267,10 +295,14 @@ async fn register_function(
             "INVALID_ARGUMENT",
             format!("source path {path:?} does not exist or is not a directory"),
         ),
-        Err(RegisterError::Unsupported(reason)) => api_error(
+        Err(RegisterError::InvalidRuntime(reason)) => {
+            api_error(StatusCode::BAD_REQUEST, "INVALID_ARGUMENT", reason)
+        }
+        Err(RegisterError::Unsupported { reason, needed }) => api_error_with_details(
             StatusCode::PRECONDITION_FAILED,
             "FAILED_PRECONDITION",
             reason,
+            json!({ "needed": needed }),
         ),
         Err(RegisterError::BuildInProgress(name)) => api_error(
             StatusCode::CONFLICT,
@@ -306,28 +338,31 @@ async fn get_function(
                 Ok(binding) => binding,
                 Err(err) => return store_error_response(&err),
             };
-            // `None` for an image-mode function's current revision (it never
-            // has a `Build` -- see `registry::service::register_image`) or a
-            // function that has never successfully deployed a revision;
-            // `fn build-log` without `--build` uses this to find the build
-            // to show.
-            let current_build_id = match function.current_revision {
-                Some(rev) => state
-                    .registry
-                    .get_revision(&name, rev)
-                    .ok()
-                    .flatten()
-                    .and_then(|r| r.build_id),
+            // `None` for a function that has never successfully deployed a
+            // revision. `current_build_id` is `None` for an image-mode
+            // function's revision (it never has a `Build` -- see
+            // `registry::service::register_image`); `fn build-log` without
+            // `--build` uses it to find the build to show.
+            let current_revision = match function.current_revision {
+                Some(rev) => state.registry.get_revision(&name, rev).ok().flatten(),
                 None => None,
+            };
+            let current_build_id = current_revision.as_ref().and_then(|r| r.build_id.clone());
+            let revisions = state
+                .registry
+                .list_revisions_for(&name, function.current_revision.unwrap_or(0))
+                .unwrap_or_default();
+            let builds = state.registry.list_builds_for(&name).unwrap_or_default();
+            let history = FunctionHistory {
+                current_build_id,
+                current_revision: current_revision.as_ref(),
+                revisions: &revisions,
+                builds: &builds,
             };
             (
                 StatusCode::OK,
                 Json(function_detail_json(
-                    &state,
-                    &function,
-                    instances,
-                    binding,
-                    current_build_id,
+                    &state, &function, instances, binding, history,
                 )),
             )
                 .into_response()
@@ -361,6 +396,10 @@ async fn get_build(
                 "revision": build.revision,
                 "mode": build.mode,
                 "status": build.status,
+                // `"cargo"` (Rust) / `"uv"` | `"pip"` (Python, once the
+                // build finishes) / `null` while still running or if it
+                // never got that far.
+                "tool": build.tool,
                 "exit_code": build.exit_code,
                 "started_at": build.started_at,
                 "finished_at": build.finished_at,
@@ -592,10 +631,23 @@ fn function_summary_json(f: &Function) -> serde_json::Value {
             Source::Dir { .. } => "dir",
             Source::Image { .. } => "image",
         },
+        // `"rust"` | `"python314"`, or `null` for an image-mode function
+        // with no declared runtime (data-model.md: display-only there).
+        "runtime": f.runtime.map(Runtime::label),
         "state": f.state,
         "current_revision": f.current_revision,
         "updated_at": f.updated_at,
     })
+}
+
+/// Deploy-history fields for [`function_detail_json`] (002-python-runtime
+/// T031/T032, and the pre-existing `revisions[]` admin-api.md already
+/// specified but this admin API never actually populated until now).
+struct FunctionHistory<'a> {
+    current_build_id: Option<String>,
+    current_revision: Option<&'a open_functions_core::model::revision::Revision>,
+    revisions: &'a [open_functions_core::model::revision::Revision],
+    builds: &'a [open_functions_core::model::build::Build],
 }
 
 fn function_detail_json(
@@ -603,8 +655,14 @@ fn function_detail_json(
     f: &Function,
     instances: usize,
     binding: Option<open_functions_core::model::TriggerBinding>,
-    current_build_id: Option<String>,
+    history: FunctionHistory<'_>,
 ) -> serde_json::Value {
+    let FunctionHistory {
+        current_build_id,
+        current_revision,
+        revisions,
+        builds,
+    } = history;
     let path_url = format!("{}/{}", state.invoke_base_url.trim_end_matches('/'), f.name);
     let host_url = state.host_suffix.as_ref().map(|suffix| {
         // Reuse the invoke base URL's scheme://port, swap in the host-based name.
@@ -624,6 +682,7 @@ fn function_detail_json(
         "name": f.name,
         "trigger": f.trigger,
         "source": f.source,
+        "runtime": f.runtime.map(Runtime::label),
         "entry_point": f.entry_point,
         "env": f.env,
         "timeout_secs": f.timeout_secs,
@@ -637,6 +696,13 @@ fn function_detail_json(
         "state": f.state,
         "current_revision": f.current_revision,
         "current_build_id": current_build_id,
+        // `build_mode`/`container_image`/`artifact_pruned` describe *how*
+        // the current revision's artifact was produced -- `null`/`false`
+        // for an image-mode function (no build step) or one that has never
+        // successfully deployed a revision.
+        "build_mode": current_revision.and_then(|r| r.build_mode),
+        "container_image": current_revision.and_then(|r| r.container_image.clone()),
+        "artifact_pruned": current_revision.is_some_and(|r| r.artifact_pruned),
         "last_error": f.last_error,
         "urls": {
             "path": path_url,
@@ -644,7 +710,39 @@ fn function_detail_json(
         },
         "instances_running": instances,
         "binding": binding,
+        // Full history (per admin-api.md's `revisions[]`), not just the
+        // current one -- `build_mode`/`container_image`/`artifact_pruned`
+        // per entry (002-python-runtime) alongside the pre-existing
+        // `number`/`artifact_path`/`build_id`/`created_at`.
+        "revisions": revisions.iter().map(revision_json).collect::<Vec<_>>(),
+        "builds": builds.iter().map(build_json).collect::<Vec<_>>(),
         "created_at": f.created_at,
         "updated_at": f.updated_at,
+    })
+}
+
+fn revision_json(r: &open_functions_core::model::revision::Revision) -> serde_json::Value {
+    json!({
+        "number": r.number,
+        "artifact_path": r.artifact_path,
+        "image_digest": r.image_digest,
+        "build_id": r.build_id,
+        "build_mode": r.build_mode,
+        "container_image": r.container_image,
+        "artifact_pruned": r.artifact_pruned,
+        "created_at": r.created_at,
+    })
+}
+
+fn build_json(b: &open_functions_core::model::build::Build) -> serde_json::Value {
+    json!({
+        "id": b.id,
+        "revision": b.revision,
+        "mode": b.mode,
+        "status": b.status,
+        "tool": b.tool,
+        "exit_code": b.exit_code,
+        "started_at": b.started_at,
+        "finished_at": b.finished_at,
     })
 }

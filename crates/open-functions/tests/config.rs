@@ -179,3 +179,121 @@ mode = "bogus"
         other => panic!("expected ConfigError::Invalid{{field: \"build.mode\"}}, got {other:?}"),
     }
 }
+
+/// `[python]` section defaults, per `specs/002-python-runtime/contracts/ops-config.md`.
+#[test]
+fn python_defaults_are_documented_values() {
+    let _guard = lock_env();
+    clear_process_env();
+
+    let cfg = config::load(None).expect("defaults-only load should succeed");
+
+    assert_eq!(cfg.python.mode, "auto");
+    assert_eq!(cfg.python.python_bin, "");
+    assert_eq!(cfg.python.uv_bin, "uv");
+    assert_eq!(cfg.python.installer, "auto");
+    assert_eq!(
+        cfg.python.container_image,
+        "ghcr.io/astral-sh/uv:python3.14-trixie-slim"
+    );
+    assert_eq!(
+        cfg.python.functions_framework,
+        "functions-framework==3.10.2"
+    );
+}
+
+#[test]
+fn python_env_var_override_wins_over_default() {
+    let _guard = lock_env();
+    clear_process_env();
+
+    // SAFETY: set for the duration of this test only, removed before returning.
+    unsafe {
+        std::env::set_var("OPEN_FUNCTIONS__PYTHON__MODE", "container");
+    }
+
+    let result = config::load(None);
+
+    // SAFETY: cleanup, always run regardless of assertion outcome below.
+    unsafe {
+        std::env::remove_var("OPEN_FUNCTIONS__PYTHON__MODE");
+    }
+
+    let cfg = result.expect("env-overridden load should succeed");
+    assert_eq!(cfg.python.mode, "container");
+}
+
+#[test]
+fn unknown_key_in_python_section_fails_load() {
+    let _guard = lock_env();
+    clear_process_env();
+
+    let mut file = tempfile::NamedTempFile::with_suffix(".toml").expect("create temp file");
+    writeln!(
+        file,
+        r#"
+[python]
+mode = "auto"
+totally_unknown_field = "boom"
+"#
+    )
+    .expect("write temp config");
+
+    let result = config::load(Some(file.path()));
+
+    assert!(result.is_err(), "unknown key should fail to load");
+    match result {
+        Err(ConfigError::Load(_)) => {}
+        other => panic!("expected ConfigError::Load, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_rejects_invalid_python_mode() {
+    let _guard = lock_env();
+    clear_process_env();
+
+    let mut file = tempfile::NamedTempFile::with_suffix(".toml").expect("create temp file");
+    writeln!(
+        file,
+        r#"
+[python]
+mode = "bogus"
+"#
+    )
+    .expect("write temp config");
+
+    let cfg = config::load(Some(file.path())).expect("load should succeed (validate is separate)");
+    let result = config::validate(&cfg);
+
+    match result {
+        Err(ConfigError::Invalid { field, .. }) => assert_eq!(field, "python.mode"),
+        other => panic!("expected ConfigError::Invalid{{field: \"python.mode\"}}, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_rejects_invalid_python_installer() {
+    let _guard = lock_env();
+    clear_process_env();
+
+    let mut file = tempfile::NamedTempFile::with_suffix(".toml").expect("create temp file");
+    writeln!(
+        file,
+        r#"
+[python]
+installer = "bogus"
+"#
+    )
+    .expect("write temp config");
+
+    let cfg = config::load(Some(file.path())).expect("load should succeed (validate is separate)");
+    let result = config::validate(&cfg);
+
+    match result {
+        Err(ConfigError::Invalid { field, .. }) => assert_eq!(field, "python.installer"),
+        other => {
+            panic!("expected ConfigError::Invalid{{field: \"python.installer\"}}, got {other:?}")
+        }
+    }
+}

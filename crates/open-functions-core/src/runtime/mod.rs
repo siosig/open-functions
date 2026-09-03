@@ -9,8 +9,11 @@
 pub mod cgroup;
 pub mod container;
 pub mod docker;
+pub mod launch;
 pub mod process;
 pub mod readiness;
+
+pub use launch::Launch;
 
 /// Everything a [`Driver`] needs to start one function instance.
 #[derive(Debug, Clone)]
@@ -24,13 +27,13 @@ pub struct InstanceSpec {
     pub env: std::collections::BTreeMap<String, String>,
     pub memory_mib: u32,
     pub start_timeout: std::time::Duration,
-    /// Path to the built/copied executable (source/host-cargo path). Unused by
-    /// container drivers.
-    pub artifact_path: std::path::PathBuf,
-    /// Image reference to run (image-mode / US4). `None` for the
-    /// source/host-cargo path; `Some` for `ContainerDriver`, which ignores
-    /// `artifact_path`.
-    pub image_ref: Option<String>,
+    /// How to start this instance (002-python-runtime): a plain child
+    /// process or a Docker container, and everything the corresponding
+    /// `Driver` needs beyond `entry_point`/`signature_type`/`env` above.
+    /// Replaces the pre-002 `artifact_path`/`image_ref` fields, which only
+    /// covered Rust source-mode and image-mode; see [`Launch`]'s own doc
+    /// comment for why Python needed a strictly more general shape.
+    pub launch: Launch,
 }
 
 /// A running function instance, however it was started.

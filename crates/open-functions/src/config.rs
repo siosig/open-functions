@@ -31,6 +31,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub runtime: RuntimeConfig,
     #[serde(default)]
+    pub python: PythonConfig,
+    #[serde(default)]
     pub defaults: DefaultsConfig,
     #[serde(default)]
     pub pubsub: PubsubConfig,
@@ -220,6 +222,60 @@ impl Default for RuntimeConfig {
             cgroup: Self::default_cgroup(),
             docker_socket: String::new(),
             docker_network: Self::default_docker_network(),
+        }
+    }
+}
+
+/// `[python]` section (002-python-runtime). `build.timeout_secs` /
+/// `build.max_parallel` apply to Python dependency resolution too -- no
+/// separate Python-only knobs for those, per contracts/ops-config.md.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PythonConfig {
+    /// One of `"auto" | "host" | "container"`. Kept as `String`; validated in `validate()`.
+    #[serde(default = "PythonConfig::default_mode")]
+    pub mode: String,
+    /// `""` means autodetect on `PATH` (`python3.14` -> `python3` -> `python`, first 3.14.x match).
+    #[serde(default)]
+    pub python_bin: String,
+    #[serde(default = "PythonConfig::default_uv_bin")]
+    pub uv_bin: String,
+    /// One of `"auto" | "uv" | "pip"`. Kept as `String`; validated in `validate()`.
+    #[serde(default = "PythonConfig::default_installer")]
+    pub installer: String,
+    #[serde(default = "PythonConfig::default_container_image")]
+    pub container_image: String,
+    #[serde(default = "PythonConfig::default_functions_framework")]
+    pub functions_framework: String,
+}
+
+impl PythonConfig {
+    fn default_mode() -> String {
+        "auto".to_string()
+    }
+    fn default_uv_bin() -> String {
+        "uv".to_string()
+    }
+    fn default_installer() -> String {
+        "auto".to_string()
+    }
+    fn default_container_image() -> String {
+        "ghcr.io/astral-sh/uv:python3.14-trixie-slim".to_string()
+    }
+    fn default_functions_framework() -> String {
+        "functions-framework==3.10.2".to_string()
+    }
+}
+
+impl Default for PythonConfig {
+    fn default() -> Self {
+        Self {
+            mode: Self::default_mode(),
+            python_bin: String::new(),
+            uv_bin: Self::default_uv_bin(),
+            installer: Self::default_installer(),
+            container_image: Self::default_container_image(),
+            functions_framework: Self::default_functions_framework(),
         }
     }
 }
@@ -497,6 +553,26 @@ pub fn validate(cfg: &AppConfig) -> Result<(), ConfigError> {
             return Err(ConfigError::Invalid {
                 field: "runtime.cgroup",
                 reason: format!("must be one of \"auto\", \"off\", got {other:?}"),
+            });
+        }
+    }
+
+    match cfg.python.mode.as_str() {
+        "auto" | "host" | "container" => {}
+        other => {
+            return Err(ConfigError::Invalid {
+                field: "python.mode",
+                reason: format!("must be one of \"auto\", \"host\", \"container\", got {other:?}"),
+            });
+        }
+    }
+
+    match cfg.python.installer.as_str() {
+        "auto" | "uv" | "pip" => {}
+        other => {
+            return Err(ConfigError::Invalid {
+                field: "python.installer",
+                reason: format!("must be one of \"auto\", \"uv\", \"pip\", got {other:?}"),
             });
         }
     }

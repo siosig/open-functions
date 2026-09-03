@@ -16,6 +16,7 @@ use crate::logs::pipe::{self, Stream as LogStream};
 use crate::logs::ring::LogStore;
 
 use super::cgroup::CgroupLimiter;
+use super::launch::Launch;
 use super::{Driver, DriverError, InstanceExit, InstanceHandle, InstanceSpec, readiness};
 
 pub struct ProcessDriver {
@@ -29,6 +30,12 @@ pub struct ProcessDriver {
 #[async_trait::async_trait]
 impl Driver for ProcessDriver {
     async fn spawn(&self, spec: &InstanceSpec) -> Result<InstanceHandle, DriverError> {
+        let Launch::Process { program, args, cwd } = &spec.launch else {
+            return Err(spawn_err(
+                "ProcessDriver::spawn requires InstanceSpec.launch to be Launch::Process",
+            ));
+        };
+
         // Reserve a free port by binding `:0`, then release it immediately so
         // the child can bind it. Standard "reserve a port" trick; the small
         // TOCTOU race here is inherent and universally accepted for this
@@ -38,17 +45,38 @@ impl Driver for ProcessDriver {
         drop(listener);
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
-        let home = spec
-            .artifact_path
-            .parent()
+        // `HOME` defaults to the *program's* parent directory (Rust
+        // source-mode: the artifact's own directory) unless `cwd` names a
+        // more appropriate one (Python host-mode: the source snapshot,
+        // which is also where `cwd` points `functions-framework` at).
+        let home = cwd
+            .as_deref()
+            .or_else(|| program.parent())
             .unwrap_or_else(|| Path::new("/tmp"))
             .to_string_lossy()
             .to_string();
 
-        let mut command = Command::new(&spec.artifact_path);
+        let mut command = Command::new(program);
+        command.args(args);
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
         command
             .env_clear()
+            // Generic baseline defaults first, so `spec.env` can override
+            // them -- Python host-mode's `spec.env` (built from
+            // `launch::python_instance_env`) carries its own venv-aware
+            // `PATH`/`HOME`, which must win here; Rust source-mode's
+            // `spec.env` has no such entries, so it still gets exactly these
+            // defaults, unchanged.
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", home)
+            .env("LANG", "C.UTF-8")
             .envs(&spec.env)
+            // FF-contract-reserved variables always win, regardless of what
+            // `spec.env` contains (`model::validate` already rejects a user
+            // declaring these, but PORT specifically can only be known here,
+            // after reserving the port above).
             .env("PORT", port.to_string())
             .env("FUNCTION_TARGET", &spec.entry_point)
             .env("FUNCTION_SIGNATURE_TYPE", spec.signature_type)
@@ -59,9 +87,6 @@ impl Driver for ProcessDriver {
             )
             .env("K_CONFIGURATION", &spec.function_name)
             .env("OPEN_FUNCTIONS_MEMORY_MIB", spec.memory_mib.to_string())
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .env("HOME", home)
-            .env("LANG", "C.UTF-8")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -163,6 +188,12 @@ impl Driver for ProcessDriver {
             exit_rx,
         })
     }
+}
+
+/// Wraps any error message as `DriverError::Spawn` (mirrors
+/// `container::spawn_err`'s identical helper).
+fn spawn_err(err: impl std::fmt::Display) -> DriverError {
+    DriverError::Spawn(std::io::Error::other(err.to_string()))
 }
 
 enum ReadinessOutcome {

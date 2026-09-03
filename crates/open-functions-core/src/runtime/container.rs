@@ -29,6 +29,7 @@ use crate::logs::pipe::{self, Stream as LogStream};
 use crate::logs::ring::{LogRingBuffer, LogStore};
 
 use super::docker::{LABEL_FUNCTION, NETWORK_NAME, ensure_network};
+use super::launch::Launch;
 use super::{Driver, DriverError, InstanceExit, InstanceHandle, InstanceSpec, readiness};
 
 /// Fixed internal port every image-mode function instance listens on, per
@@ -79,9 +80,18 @@ impl Driver for ContainerDriver {
     }
 
     async fn spawn(&self, spec: &InstanceSpec) -> Result<InstanceHandle, DriverError> {
-        let image_ref = spec.image_ref.as_deref().ok_or_else(|| {
-            spawn_err("ContainerDriver::spawn requires InstanceSpec.image_ref to be Some(_)")
-        })?;
+        let Launch::Container {
+            image,
+            binds,
+            cmd,
+            working_dir,
+        } = &spec.launch
+        else {
+            return Err(spawn_err(
+                "ContainerDriver::spawn requires InstanceSpec.launch to be Launch::Container",
+            ));
+        };
+        let image_ref = image.as_str();
 
         ensure_network(&self.docker).await.map_err(spawn_err)?;
         ensure_image(&self.docker, image_ref).await?;
@@ -98,9 +108,20 @@ impl Driver for ContainerDriver {
         let body = ContainerCreateBody {
             image: Some(image_ref.to_string()),
             env: Some(env),
+            // `binds`/`cmd`/`working_dir` are empty/`None` for image-mode
+            // (`Launch::image`) and set for Python container-mode
+            // (`Launch::python_container`) -- see that constructor's own
+            // doc comment for what each carries.
+            cmd: cmd.clone(),
+            working_dir: working_dir.clone(),
             host_config: Some(HostConfig {
                 memory: Some(memory_bytes),
                 network_mode: Some(NETWORK_NAME.to_string()),
+                binds: if binds.is_empty() {
+                    None
+                } else {
+                    Some(binds.clone())
+                },
                 ..Default::default()
             }),
             labels: Some(HashMap::from([(

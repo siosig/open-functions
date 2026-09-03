@@ -26,4 +26,9 @@ pub struct Build {
     pub exit_code: Option<i32>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The tool actually used (002-python-runtime): `"cargo"` for Rust,
+    /// `"uv"` / `"pip"` for Python dependency resolution. `None` for
+    /// records persisted before this field existed.
+    #[serde(default)]
+    pub tool: Option<String>,
 }

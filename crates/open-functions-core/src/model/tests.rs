@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use proptest::prelude::*;
 
 use super::function::{Function, FunctionState, QueuePolicy, Source, Trigger};
+use super::runtime::Runtime;
 use super::validate::{
     ValidationError, validate_env, validate_function, validate_name, validate_topic,
 };
@@ -16,6 +17,7 @@ fn valid_function() -> Function {
     Function {
         name: "hello-world".to_string(),
         trigger: Trigger::Http,
+        runtime: Some(Runtime::Rust),
         source: Source::Dir {
             path: "/tmp/hello-world".to_string(),
             bin: None,
@@ -297,6 +299,78 @@ fn pubsub_trigger_with_invalid_topic_is_rejected() {
 #[test]
 fn valid_function_passes() {
     assert!(validate_function(&valid_function()).is_ok());
+}
+
+// ---- validate_function: runtime-specific rules (002-python-runtime) ----
+
+#[test]
+fn python314_requires_no_cargo_toml_and_accepts_a_valid_entry_point() {
+    let mut f = valid_function();
+    f.runtime = Some(Runtime::Python314);
+    f.entry_point = "hello".to_string();
+    assert!(validate_function(&f).is_ok());
+}
+
+#[test]
+fn python314_rejects_a_non_identifier_entry_point() {
+    let mut f = valid_function();
+    f.runtime = Some(Runtime::Python314);
+    for bad in ["1hello", "hello-world", "hello world", ""] {
+        f.entry_point = bad.to_string();
+        assert!(
+            matches!(
+                validate_function(&f),
+                Err(ValidationError::InvalidPythonEntryPoint(_))
+            ),
+            "expected {bad:?} to be rejected as an invalid Python entry point"
+        );
+    }
+}
+
+#[test]
+fn python314_rejects_source_bin() {
+    let mut f = valid_function();
+    f.runtime = Some(Runtime::Python314);
+    f.source = Source::Dir {
+        path: "/tmp/hello-world".to_string(),
+        bin: Some("hello".to_string()),
+    };
+    assert!(matches!(
+        validate_function(&f),
+        Err(ValidationError::BinNotApplicableToPython)
+    ));
+}
+
+#[test]
+fn rust_still_accepts_a_hyphenated_entry_point_and_a_bin_override() {
+    // Rust's entry_point (FUNCTION_TARGET, a cargo bin/fn name) and
+    // source.bin (cargo --bin selection) are unrestricted by the
+    // Python-only rules above -- a Rust function with a name that would be
+    // an invalid Python identifier, or an explicit bin, must still pass.
+    let mut f = valid_function();
+    f.runtime = Some(Runtime::Rust);
+    f.entry_point = "hello".to_string();
+    f.source = Source::Dir {
+        path: "/tmp/hello-world".to_string(),
+        bin: Some("hello-bin".to_string()),
+    };
+    assert!(validate_function(&f).is_ok());
+}
+
+#[test]
+fn reserved_env_names_include_python_specific_keys_for_every_runtime() {
+    for reserved in ["HOST", "FUNCTION_SOURCE", "VIRTUAL_ENV"] {
+        let mut f = valid_function();
+        f.runtime = Some(Runtime::Rust);
+        f.env.insert(reserved.to_string(), "x".to_string());
+        assert!(
+            matches!(
+                validate_function(&f),
+                Err(ValidationError::ReservedEnvKey(_))
+            ),
+            "expected {reserved:?} to be reserved even for a Rust function"
+        );
+    }
 }
 
 // ---- property tests ----

@@ -8,7 +8,7 @@
 //! tripping those lints.
 
 use open_functions_core::model::function::{FunctionState, QueuePolicy, Source, Trigger};
-use open_functions_core::model::{Function, Revision};
+use open_functions_core::model::{Function, Revision, Runtime};
 use open_functions_core::registry::redb_store::RedbStore;
 use open_functions_core::registry::store::{Store, StoreError};
 
@@ -25,6 +25,7 @@ fn sample_function(name: &str) -> Function {
     Function {
         name: name.to_string(),
         trigger: Trigger::Http,
+        runtime: Some(Runtime::Rust),
         source: Source::Dir {
             path: format!("/tmp/{name}"),
             bin: None,
@@ -55,6 +56,9 @@ fn sample_revision(name: &str, number: u32) -> Revision {
         image_digest: None,
         build_id: None,
         snapshot: sample_function(name),
+        build_mode: Some(open_functions_core::model::build::BuildMode::Host),
+        container_image: None,
+        artifact_pruned: false,
         created_at: chrono::Utc::now(),
     }
 }

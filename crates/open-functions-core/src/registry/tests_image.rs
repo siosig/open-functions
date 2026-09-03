@@ -13,10 +13,14 @@ use tokio::sync::Semaphore;
 
 use crate::build::container::ContainerBuilder;
 use crate::build::host_cargo::HostCargoBuilder;
+use crate::build::python::Installer as PythonInstaller;
+use crate::build::python::env::passthrough_env;
+use crate::build::python::host::HostPythonBuilder;
 use crate::model::function::{QueuePolicy as ModelQueuePolicy, Source, Trigger};
 use crate::registry::memory::MemoryStore;
 use crate::registry::service::{
-    BuildModeSetting, RegisterError, RegisterRequest, RegistrationDefaults, RegistryService,
+    BuildModeSetting, PythonModeSetting, PythonSettings, RegisterError, RegisterRequest,
+    RegistrationDefaults, RegistryService,
 };
 use crate::runtime::cgroup::CgroupLimiter;
 use crate::runtime::container::ContainerDriver;
@@ -67,6 +71,22 @@ fn registry_with_docker_socket(data_dir: &std::path::Path, docker_socket: &str) 
         log_store: Arc::new(crate::logs::ring::LogStore::default()),
     });
     let global_limit = Arc::new(Semaphore::new(8));
+    let cache_root = data_dir.join("cache");
+    let python = PythonSettings {
+        mode: PythonModeSetting::Host,
+        host_builder: Arc::new(HostPythonBuilder {
+            python_bin_override: String::new(),
+            uv_bin: "uv".to_string(),
+        }),
+        container_builder: None,
+        installer: PythonInstaller::Auto,
+        python_bin: String::new(),
+        uv_bin: "uv".to_string(),
+        container_image: "ghcr.io/astral-sh/uv:python3.14-trixie-slim".to_string(),
+        functions_framework_spec: "functions-framework==3.10.2".to_string(),
+        cache_root: cache_root.clone(),
+        passthrough_env: passthrough_env(&std::env::vars().collect(), &cache_root),
+    };
 
     RegistryService::new(
         store,
@@ -82,6 +102,7 @@ fn registry_with_docker_socket(data_dir: &std::path::Path, docker_socket: &str) 
         defaults(),
         None,
         Arc::new(crate::logs::ring::LogStore::default()),
+        python,
     )
 }
 
@@ -92,6 +113,7 @@ fn image_request(name: &str, image_ref: &str) -> RegisterRequest {
         source: Source::Image {
             image_ref: image_ref.to_string(),
         },
+        runtime: None,
         entry_point: Some("hello".to_string()),
         env: BTreeMap::new(),
         timeout_secs: None,
@@ -123,11 +145,12 @@ async fn image_registration_with_unreachable_docker_returns_precondition_failed(
         .await;
 
     match result {
-        Err(RegisterError::Unsupported(reason)) => {
+        Err(RegisterError::Unsupported { reason, needed }) => {
             assert!(
                 reason.to_lowercase().contains("docker"),
                 "expected the precondition failure to mention Docker, got: {reason:?}"
             );
+            assert_eq!(needed, vec!["docker".to_string()]);
         }
         other => panic!("expected RegisterError::Unsupported (412), got {other:?}"),
     }

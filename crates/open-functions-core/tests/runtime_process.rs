@@ -63,8 +63,7 @@ fn base_spec(artifact_path: PathBuf) -> InstanceSpec {
         env: BTreeMap::new(),
         memory_mib: 128,
         start_timeout: Duration::from_secs(10),
-        artifact_path,
-        image_ref: None,
+        launch: open_functions_core::runtime::Launch::rust_process(artifact_path),
     }
 }
 
@@ -74,6 +73,25 @@ fn driver() -> ProcessDriver {
         log_store: Arc::new(LogStore::default()),
     }
 }
+
+/// A tiny, dependency-free "instance" for [`launch_process_honors_args_and_cwd`]:
+/// binds `$PORT` (readiness only needs a raw TCP connect -- see
+/// `runtime::readiness`) and, before blocking on `accept()` forever, records
+/// its own `argv[1:]` and `getcwd()` to `result.json` in its cwd, so the test
+/// can read those back after `spawn()` returns and confirm `Launch::Process`'s
+/// `args`/`cwd` actually reached the child (002-python-runtime T009).
+const RECORD_ARGV_AND_CWD_SCRIPT: &str = r#"
+import json, os, socket, sys
+port = int(os.environ["PORT"])
+with open("result.json", "w") as f:
+    json.dump({"argv": sys.argv[1:], "cwd": os.getcwd()}, f)
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(1)
+while True:
+    s.accept()
+"#;
 
 #[tokio::test]
 async fn spawn_serves_http_and_readiness_holds() {
@@ -240,6 +258,72 @@ async fn instance_stdout_is_retained_in_the_function_log_ring_buffer() {
             .iter()
             .map(|r| &r.message)
             .collect::<Vec<_>>()
+    );
+
+    let _ = handle.stop(Duration::from_secs(5)).await;
+}
+
+/// T009 (002-python-runtime): `Launch::Process`'s `args`/`cwd` reach the
+/// spawned child, not just its `program`. `readiness::wait_ready` only needs
+/// a raw TCP connect (no HTTP request), so this doesn't need a real HTTP
+/// server -- see `RECORD_ARGV_AND_CWD_SCRIPT`.
+#[tokio::test]
+async fn launch_process_honors_args_and_cwd() {
+    let driver = driver();
+    let cwd = tempfile::tempdir().expect("tempdir");
+
+    let spec = InstanceSpec {
+        function_name: "args-cwd-check".to_string(),
+        revision: 1,
+        entry_point: "hello".to_string(),
+        signature_type: "http",
+        env: BTreeMap::new(),
+        memory_mib: 128,
+        start_timeout: Duration::from_secs(10),
+        launch: open_functions_core::runtime::Launch::Process {
+            program: PathBuf::from("python3"),
+            args: vec![
+                "-c".to_string(),
+                RECORD_ARGV_AND_CWD_SCRIPT.to_string(),
+                "marker-value".to_string(),
+            ],
+            cwd: Some(cwd.path().to_path_buf()),
+        },
+    };
+
+    let handle = driver
+        .spawn(&spec)
+        .await
+        .expect("spawn should succeed for a Launch::Process with args/cwd");
+
+    let result_path = cwd.path().join("result.json");
+    let mut contents = String::new();
+    for _ in 0..50 {
+        if let Ok(read) = std::fs::read_to_string(&result_path) {
+            contents = read;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !contents.is_empty(),
+        "expected {result_path:?} to have been written by the spawned process"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&contents).expect("result.json should be valid JSON");
+    assert_eq!(
+        parsed["argv"],
+        serde_json::json!(["marker-value"]),
+        "Launch::Process.args did not reach the child's argv"
+    );
+    let recorded_cwd = parsed["cwd"]
+        .as_str()
+        .expect("cwd field should be a string");
+    assert_eq!(
+        std::fs::canonicalize(recorded_cwd).expect("canonicalize recorded cwd"),
+        std::fs::canonicalize(cwd.path()).expect("canonicalize expected cwd"),
+        "Launch::Process.cwd did not reach the child's working directory"
     );
 
     let _ = handle.stop(Duration::from_secs(5)).await;

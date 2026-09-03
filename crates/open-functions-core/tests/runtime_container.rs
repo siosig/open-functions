@@ -138,8 +138,7 @@ fn base_spec() -> InstanceSpec {
         env: BTreeMap::new(),
         memory_mib: 128,
         start_timeout: Duration::from_secs(30),
-        artifact_path: PathBuf::new(),
-        image_ref: Some(ensure_test_image().to_string()),
+        launch: open_functions_core::runtime::Launch::image(ensure_test_image().to_string()),
     }
 }
 
@@ -302,4 +301,64 @@ async fn sweep_stale_containers_removes_labeled_leftovers() {
         remaining.is_empty(),
         "expected the stale container to be gone after sweep, found {remaining:?}"
     );
+}
+
+/// T010 (002-python-runtime): `Launch::Container`'s `binds`/`cmd`/
+/// `working_dir` -- unused by image-mode's `Launch::image` (empty/`None`,
+/// already covered above) -- actually reach `ContainerCreateBody`/
+/// `HostConfig` when set, the shape Python container-mode needs
+/// (`Launch::python_container`). Binds a tempdir containing a marker file
+/// read-only at `/srv`, overrides `cmd` to serve it with `python -m
+/// http.server` from `working_dir = /srv`, and confirms the marker is
+/// reachable over HTTP -- if `working_dir` weren't honored, `http.server`
+/// would serve the image's own default directory instead and 404.
+#[tokio::test]
+async fn spawn_honors_launch_container_binds_cmd_and_working_dir() {
+    require_docker_test!();
+
+    let docker = docker_client();
+    let driver = ContainerDriver::new(docker.clone());
+
+    let host_dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(host_dir.path().join("marker.txt"), "launch-container-t010")
+        .expect("write marker file");
+
+    let spec = InstanceSpec {
+        function_name: "launch-container-check".to_string(),
+        revision: 1,
+        entry_point: "unused".to_string(),
+        signature_type: "http",
+        env: BTreeMap::new(),
+        memory_mib: 128,
+        start_timeout: Duration::from_secs(30),
+        launch: open_functions_core::runtime::Launch::Container {
+            image: "python:3.14-slim".to_string(),
+            binds: vec![format!("{}:/srv:ro", host_dir.path().display())],
+            cmd: Some(vec![
+                "python3".to_string(),
+                "-m".to_string(),
+                "http.server".to_string(),
+                "8080".to_string(),
+            ]),
+            working_dir: Some("/srv".to_string()),
+        },
+    };
+
+    let handle = driver
+        .spawn(&spec)
+        .await
+        .expect("spawn should succeed for a Launch::Container with binds/cmd/working_dir");
+
+    let resp = reqwest::get(format!("http://{}/marker.txt", handle.addr))
+        .await
+        .expect("HTTP GET to the instance should succeed");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "expected /marker.txt to be served from the bind-mounted, working_dir-selected /srv"
+    );
+    let body = resp.text().await.expect("response body should be text");
+    assert_eq!(body, "launch-container-t010");
+
+    let _ = handle.stop(Duration::from_secs(5)).await;
 }

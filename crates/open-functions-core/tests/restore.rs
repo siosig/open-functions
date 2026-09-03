@@ -16,15 +16,19 @@ use std::time::Duration;
 
 use open_functions_core::build::container::ContainerBuilder;
 use open_functions_core::build::host_cargo::HostCargoBuilder;
+use open_functions_core::build::python::Installer as PythonInstaller;
+use open_functions_core::build::python::env::passthrough_env;
+use open_functions_core::build::python::host::HostPythonBuilder;
 use open_functions_core::logs::ring::LogStore;
 use open_functions_core::model::build::{Build, BuildMode, BuildStatus};
 use open_functions_core::model::function::{
     Function, FunctionState, QueuePolicy as ModelQueuePolicy, Source, Trigger,
 };
 use open_functions_core::model::revision::Revision;
+use open_functions_core::model::runtime::Runtime;
 use open_functions_core::registry::redb_store::RedbStore;
 use open_functions_core::registry::service::{
-    BuildModeSetting, RegistrationDefaults, RegistryService,
+    BuildModeSetting, PythonModeSetting, PythonSettings, RegistrationDefaults, RegistryService,
 };
 use open_functions_core::registry::store::Store;
 use open_functions_core::runtime::cgroup::CgroupLimiter;
@@ -101,6 +105,22 @@ fn new_registry(data_dir: &Path) -> (RegistryService, Arc<dyn Store>) {
         log_store: Arc::new(LogStore::default()),
     });
     let global_limit = Arc::new(tokio::sync::Semaphore::new(32));
+    let cache_root = data_dir.join("cache");
+    let python = PythonSettings {
+        mode: PythonModeSetting::Host,
+        host_builder: Arc::new(HostPythonBuilder {
+            python_bin_override: String::new(),
+            uv_bin: "uv".to_string(),
+        }),
+        container_builder: None,
+        installer: PythonInstaller::Auto,
+        python_bin: String::new(),
+        uv_bin: "uv".to_string(),
+        container_image: "ghcr.io/astral-sh/uv:python3.14-trixie-slim".to_string(),
+        functions_framework_spec: "functions-framework==3.10.2".to_string(),
+        cache_root: cache_root.clone(),
+        passthrough_env: passthrough_env(&std::env::vars().collect(), &cache_root),
+    };
 
     let registry = RegistryService::new(
         Arc::clone(&store),
@@ -116,6 +136,7 @@ fn new_registry(data_dir: &Path) -> (RegistryService, Arc<dyn Store>) {
         defaults(),
         None,
         Arc::new(LogStore::default()),
+        python,
     );
     (registry, store)
 }
@@ -127,6 +148,7 @@ fn base_function(name: &str, state: FunctionState, current_revision: Option<u32>
     Function {
         name: name.to_string(),
         trigger: Trigger::Http,
+        runtime: Some(Runtime::Rust),
         source: Source::Dir {
             path: "unused-for-restore".to_string(),
             bin: None,
@@ -160,6 +182,9 @@ fn revision_for(function: &Function, number: u32, artifact_path: &Path) -> Revis
         image_digest: None,
         build_id: None,
         snapshot,
+        build_mode: Some(BuildMode::Host),
+        container_image: None,
+        artifact_pruned: false,
         created_at: chrono::Utc::now(),
     }
 }
@@ -208,6 +233,7 @@ async fn interrupted_build_without_prior_revision_marks_function_failed() {
             exit_code: None,
             started_at: chrono::Utc::now(),
             finished_at: None,
+            tool: Some("cargo".to_string()),
         })
         .expect("put_build");
 
@@ -255,6 +281,7 @@ async fn interrupted_redeploy_build_keeps_previous_revision_ready() {
             exit_code: None,
             started_at: chrono::Utc::now(),
             finished_at: None,
+            tool: Some("cargo".to_string()),
         })
         .expect("put_build");
 
@@ -291,6 +318,49 @@ async fn ready_function_with_missing_artifact_is_reported_broken() {
 
     let report = registry.restore().await.expect("restore");
     assert_eq!(report.broken_functions, vec!["broken-fn".to_string()]);
+}
+
+#[tokio::test]
+async fn restore_backfills_runtime_for_dir_sources_and_leaves_image_sources_none() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let (registry, store) = new_registry(data_dir.path());
+
+    // A pre-002 Rust source-mode record persisted before `Function.runtime`
+    // existed: `runtime: None`, exactly as `#[serde(default)]` would decode
+    // it from an old JSON payload that never had the field.
+    let mut dir_function = base_function("legacy-dir", FunctionState::Building, None);
+    dir_function.runtime = None;
+    store.put_function(&dir_function).expect("put_function");
+
+    // A pre-002 image-mode record, also `runtime: None` — must stay `None`
+    // (data-model.md: only `Source::Dir` gets backfilled to `Rust`).
+    let mut image_function = base_function("legacy-image", FunctionState::Building, None);
+    image_function.runtime = None;
+    image_function.source = Source::Image {
+        image_ref: "example.com/legacy-image:v1".to_string(),
+    };
+    store.put_function(&image_function).expect("put_function");
+
+    registry.restore().await.expect("restore");
+
+    let stored_dir = store
+        .get_function("legacy-dir")
+        .expect("get_function")
+        .expect("function should still exist");
+    assert_eq!(
+        stored_dir.runtime,
+        Some(Runtime::Rust),
+        "a runtime-less Source::Dir record must be backfilled to Rust and persisted"
+    );
+
+    let stored_image = store
+        .get_function("legacy-image")
+        .expect("get_function")
+        .expect("function should still exist");
+    assert_eq!(
+        stored_image.runtime, None,
+        "a runtime-less Source::Image record must stay None"
+    );
 }
 
 #[tokio::test]

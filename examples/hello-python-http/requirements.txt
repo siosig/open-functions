@@ -1,0 +1,1 @@
+# functions-framework intentionally omitted — the host auto-adds it (see contracts/python-function-contract.md)

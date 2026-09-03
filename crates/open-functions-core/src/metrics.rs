@@ -15,8 +15,8 @@
 //! | `open_functions_instance_crashes_total` | counter | `function` | `pool::instance::report_dead` |
 //! | `open_functions_cold_start_seconds` | histogram | `function`, `driver` | `pool::instance::finish_start` |
 //! | `open_functions_queue_wait_seconds` | histogram | `function` | `pool::instance::acquire` |
-//! | `open_functions_builds_total` | counter | `function`, `mode`, `result` | `registry::service::register_source` |
-//! | `open_functions_build_duration_seconds` | histogram | `mode` | `registry::service::register_source` |
+//! | `open_functions_builds_total` | counter | `function`, `mode`, `result` | `registry::service::register_source_rust` |
+//! | `open_functions_build_duration_seconds` | histogram | `mode` | `registry::service::register_source_rust` |
 //! | `open_functions_functions` | gauge | `state` | `registry::service::report_function_state_gauge` |
 //! | `open_functions_build_info` | gauge | `version`, `git_sha` | `open-functions`'s `serve::run`, once at startup |
 //! | `open_functions_pubsub_bindings` | gauge | `state` | `pubsub::reconcile::Reconciler::report_binding_gauge` |

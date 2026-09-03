@@ -15,6 +15,16 @@
 # the root one above
 examples/*/target/
 
+# Python
+# same rationale as examples/*/target/ above: Python example functions
+# (examples/hello-python-http/, examples/hello-python-pubsub/, and any
+# future ones) each get their own local venv when developers manually test
+# them, so it's a standalone per-example environment, not shared
+examples/*/.venv/
+examples/*/__pycache__/
+**/__pycache__/
+*.pyc
+
 # local scratch
 /tmp/
 

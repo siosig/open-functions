@@ -103,6 +103,7 @@ impl Store for MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Runtime;
     use crate::model::binding::BindingState;
     use crate::model::build::{BuildMode, BuildStatus};
     use crate::model::function::{FunctionState, QueuePolicy, Source, Trigger};
@@ -125,6 +126,7 @@ mod tests {
         Function {
             name: name.to_string(),
             trigger: Trigger::Http,
+            runtime: Some(Runtime::Rust),
             source: Source::Dir {
                 path: "/tmp/src".to_string(),
                 bin: None,
@@ -202,6 +204,9 @@ mod tests {
             image_digest: None,
             build_id: Some("build-1".to_string()),
             snapshot,
+            build_mode: Some(BuildMode::Host),
+            container_image: None,
+            artifact_pruned: false,
             created_at: Utc::now(),
         };
         ok(store.put_revision(&revision), "put_revision");
@@ -227,6 +232,7 @@ mod tests {
             exit_code: Some(0),
             started_at: Utc::now(),
             finished_at: Some(Utc::now()),
+            tool: Some("cargo".to_string()),
         };
         ok(store.put_build(&build), "put_build");
 

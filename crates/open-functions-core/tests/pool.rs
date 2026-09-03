@@ -64,8 +64,7 @@ fn base_spec(artifact_path: PathBuf) -> InstanceSpec {
         env: BTreeMap::new(),
         memory_mib: 128,
         start_timeout: Duration::from_secs(10),
-        artifact_path,
-        image_ref: None,
+        launch: open_functions_core::runtime::Launch::rust_process(artifact_path),
     }
 }
 

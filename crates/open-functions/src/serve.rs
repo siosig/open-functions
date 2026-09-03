@@ -10,13 +10,17 @@ use std::time::Duration;
 
 use open_functions_core::build::container::ContainerBuilder;
 use open_functions_core::build::host_cargo::HostCargoBuilder;
+use open_functions_core::build::python::Installer as PythonInstaller;
+use open_functions_core::build::python::env::passthrough_env;
+use open_functions_core::build::python::host::HostPythonBuilder;
 use open_functions_core::logs::ring::LogStore;
 use open_functions_core::model::function::QueuePolicy as ModelQueuePolicy;
 use open_functions_core::pubsub::client::OpenPubusbClient;
 use open_functions_core::pubsub::reconcile::Reconciler;
 use open_functions_core::registry::redb_store::RedbStore;
 use open_functions_core::registry::service::{
-    BuildModeSetting, PubsubBindingConfig, RegistrationDefaults, RegistryService,
+    BuildModeSetting, PubsubBindingConfig, PythonModeSetting, PythonSettings, RegistrationDefaults,
+    RegistryService,
 };
 use open_functions_core::resolve::Resolver;
 use open_functions_core::runtime::cgroup::CgroupLimiter;
@@ -149,6 +153,39 @@ pub async fn run(cfg: AppConfig) -> ExitCode {
     };
     let global_limit = Arc::new(Semaphore::new(cfg.runtime.max_total_instances as usize));
 
+    let python_mode = match cfg.python.mode.as_str() {
+        "host" => PythonModeSetting::Host,
+        "container" => PythonModeSetting::Container,
+        // `config::validate()` already rejects anything but
+        // "auto"/"host"/"container" before `run` is ever reached.
+        _ => PythonModeSetting::Auto,
+    };
+    let python_installer = match cfg.python.installer.as_str() {
+        "uv" => PythonInstaller::Uv,
+        "pip" => PythonInstaller::Pip,
+        // `config::validate()` already rejects anything but "auto"/"uv"/"pip".
+        _ => PythonInstaller::Auto,
+    };
+    let python_cache_root = data_dir.join("cache");
+    let python = PythonSettings {
+        mode: python_mode,
+        host_builder: Arc::new(HostPythonBuilder {
+            python_bin_override: cfg.python.python_bin.clone(),
+            uv_bin: cfg.python.uv_bin.clone(),
+        }),
+        // Wired in by T034/T035 once `ContainerPythonBuilder` exists;
+        // `python.mode = container`/`auto` fall back to `Unsupported`/`host`
+        // respectively until then (`select_python_builder`'s own doc comment).
+        container_builder: None,
+        installer: python_installer,
+        python_bin: cfg.python.python_bin.clone(),
+        uv_bin: cfg.python.uv_bin.clone(),
+        container_image: cfg.python.container_image.clone(),
+        functions_framework_spec: cfg.python.functions_framework.clone(),
+        cache_root: python_cache_root.clone(),
+        passthrough_env: passthrough_env(&std::env::vars().collect(), &python_cache_root),
+    };
+
     let invoke_base_url = if cfg.invoke.public_base_url.is_empty() {
         format!("http://{}", display_addr(&cfg.invoke.listen))
     } else {
@@ -203,6 +240,7 @@ pub async fn run(cfg: AppConfig) -> ExitCode {
         defaults,
         pubsub_binding,
         Arc::clone(&log_store),
+        python,
     ));
 
     let host_suffix = if cfg.invoke.host_suffix.is_empty() {
