@@ -133,9 +133,8 @@ cargo run -p open-functions -- fn deploy hello --source ./examples/hello-http --
 curl http://127.0.0.1:8080/hello/world
 ```
 
-See the workspace root [`README.md`](../../README.ja.md) and
-[`specs/001-cloud-functions-local/quickstart.md`](../../specs/001-cloud-functions-local/quickstart.md)
-for the full `open-functions` CLI walkthrough, including Pub/Sub triggers, container
+See the workspace root [`README.md`](../../README.md) for the full
+`open-functions` CLI walkthrough, including Pub/Sub triggers, container
 images, and admin/observability endpoints.
 
 ## Deploying to Google Cloud Run functions unmodified

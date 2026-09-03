@@ -82,9 +82,8 @@ A handful of variables are worth setting explicitly on a first run:
 
 The rest of the public variables — ports, data directory, ps-rs
 integration, Docker network name, verification behavior, and so on — have
-sane defaults. See `roles/open_functions/defaults/main.yml` for the full list, or
-`specs/001-cloud-functions-local/contracts/ansible-vars.md` for the
-documented contract.
+sane defaults. See `roles/open_functions/defaults/main.yml` for the full
+list and each variable's own comment.
 
 ## Inventory
 
@@ -95,9 +94,8 @@ deployment, and a Docker deployment co-located with ps-rs.
 
 ## Variables
 
-See `roles/open_functions/defaults/main.yml` for the authoritative list of defaults,
-and `specs/001-cloud-functions-local/contracts/ansible-vars.md` for the
-documented public variable contract this playbook relies on.
+See `roles/open_functions/defaults/main.yml` for the authoritative list of
+defaults and each variable's own comment.
 
 ## Tags
 
