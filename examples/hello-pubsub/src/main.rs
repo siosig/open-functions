@@ -5,7 +5,7 @@
 //! Test-only behavior, controlled by env vars (mirrors examples/hello-http,
 //! used by open-functions's own test suite):
 //! - `FAIL=1`: returns `Err(...)` instead of processing the message (open-functions
-//!   responds 500 to ps-rs's Push delivery, which then retries per its own
+//!   responds 500 to open-pubusb's Push delivery, which then retries per its own
 //!   backoff policy).
 
 use open_functions_sdk::cloudevent::DataError;

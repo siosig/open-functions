@@ -12,7 +12,7 @@ use open_functions_core::build::container::ContainerBuilder;
 use open_functions_core::build::host_cargo::HostCargoBuilder;
 use open_functions_core::logs::ring::LogStore;
 use open_functions_core::model::function::QueuePolicy as ModelQueuePolicy;
-use open_functions_core::pubsub::client::PsRsClient;
+use open_functions_core::pubsub::client::OpenPubusbClient;
 use open_functions_core::pubsub::reconcile::Reconciler;
 use open_functions_core::registry::redb_store::RedbStore;
 use open_functions_core::registry::service::{
@@ -156,7 +156,7 @@ pub async fn run(cfg: AppConfig) -> ExitCode {
     };
 
     let pubsub_binding = if cfg.pubsub.enabled {
-        let client = PsRsClient::new(
+        let client = OpenPubusbClient::new(
             cfg.pubsub.base_url.clone(),
             cfg.pubsub.project.clone(),
             Duration::from_secs(u64::from(cfg.pubsub.request_timeout_secs)),
@@ -172,7 +172,7 @@ pub async fn run(cfg: AppConfig) -> ExitCode {
         } else {
             cfg.pubsub.push_base_url.clone()
         };
-        // Background retry sweep for bindings ps-rs was unreachable for
+        // Background retry sweep for bindings open-pubusb was unreachable for
         // (or that failed to unbind) at the time they were first attempted.
         let _reaper = Arc::clone(&reconciler).spawn_retry_loop(
             Duration::from_secs(5),

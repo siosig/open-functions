@@ -8,8 +8,8 @@
 # full variable reference.
 #
 # Two example hosts are shown:
-#   - open-functions-systemd-01: systemd deploy mode, standalone (no ps-rs).
-#   - open-functions-docker-01:  docker deploy mode, co-located with ps-rs on the
+#   - open-functions-systemd-01: systemd deploy mode, standalone (no open-pubusb).
+#   - open-functions-docker-01:  docker deploy mode, co-located with open-pubusb on the
 #                       same host, both containers on the `open-functions` Docker
 #                       network and addressed by container name. This is
 #                       the standard co-location setup documented in
@@ -28,19 +28,19 @@ all:
           # open_functions_source_dirs:
           #   - /srv/open-functions/functions
 
-        # --- docker mode, co-located with ps-rs ---------------------------
-        # ps-rs (Pub/Sub-compatible REST API) is deployed separately using
-        # the ps-rs project's own Ansible role/playbook
-        # (~/workspace/siosig/ps-rs), attached to the same `open_functions_docker_network`
-        # (default: open-functions) under the container name `ps-rs`. open-functions is then
-        # able to reach it, and ps-rs is able to push events back to open-functions,
+        # --- docker mode, co-located with open-pubusb ---------------------------
+        # open-pubusb (Pub/Sub-compatible REST API) is deployed separately using
+        # the open-pubusb project's own Ansible role/playbook
+        # (~/workspace/siosig/open-pubusb), attached to the same `open_functions_docker_network`
+        # (default: open-functions) under the container name `open-pubusb`. open-functions is then
+        # able to reach it, and open-pubusb is able to push events back to open-functions,
         # by container name on that shared network.
         open-functions-docker-01:
           ansible_host: 203.0.113.20
           ansible_user: ansible
           open_functions_deploy_mode: docker
           open_functions_docker_network: open-functions
-          open_functions_pubsub_base_url: http://ps-rs:8085
+          open_functions_pubsub_base_url: http://open-pubusb:8085
           open_functions_pubsub_project: local
           open_functions_pubsub_push_base_url: http://open-functions:8080
           # open_functions_source_mounts:

@@ -62,7 +62,7 @@ pub enum BuildModeSetting {
 pub struct PubsubBindingConfig {
     pub reconciler: Arc<Reconciler>,
     pub project: String,
-    /// Base URL ps-rs should POST Push deliveries to, e.g.
+    /// Base URL open-pubusb should POST Push deliveries to, e.g.
     /// `http://127.0.0.1:8080`; the full push endpoint is
     /// `{push_base_url}/_cf/push/{function_name}`.
     pub push_base_url: String,
@@ -438,7 +438,7 @@ impl RegistryService {
 
         // FR-010: a Pub/Sub-triggered function's binding is created at
         // registration time, independent of whether the build succeeds —
-        // the function isn't reachable yet either way, and ps-rs's own
+        // the function isn't reachable yet either way, and open-pubusb's own
         // retry policy handles a temporarily-unready push endpoint the same
         // as it would a slow HTTP function.
         if let Trigger::Pubsub { topic } = &function.trigger {
@@ -719,13 +719,13 @@ impl RegistryService {
         Ok(())
     }
 
-    /// Creates or fixes the ps-rs Push subscription for a Pub/Sub-triggered
+    /// Creates or fixes the open-pubusb Push subscription for a Pub/Sub-triggered
     /// function, per FR-010/FR-013. A no-op (with a one-time `warn!`) if
     /// Pub/Sub support is disabled (`pubsub.enabled = false`). Failures
-    /// (including ps-rs being unreachable) are not propagated as
+    /// (including open-pubusb being unreachable) are not propagated as
     /// `RegisterError` — `Reconciler::try_bind` already persists a `pending`
     /// `TriggerBinding` for the retry sweep to pick up, so a temporarily
-    /// down ps-rs must not fail the whole registration.
+    /// down open-pubusb must not fail the whole registration.
     async fn bind_pubsub_trigger(&self, function_name: &str, topic: &str, timeout_secs: u32) {
         let Some(pubsub) = &self.pubsub else {
             tracing::warn!(
@@ -750,7 +750,7 @@ impl RegistryService {
         }
     }
 
-    /// Removes the ps-rs Push subscription for a function being deleted, if
+    /// Removes the open-pubusb Push subscription for a function being deleted, if
     /// it had a Pub/Sub trigger and Pub/Sub support is enabled.
     async fn unbind_pubsub_trigger(&self, function_name: &str) {
         let Some(pubsub) = &self.pubsub else {

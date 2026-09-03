@@ -17,9 +17,12 @@ examples/*/target/
 specs/
 .specify/
 
-# Standalone example function crates: each is its own [workspace], not a
-# member of the root workspace, and irrelevant to building the open-functions binary
-examples/
+# Standalone example function crates (each its own [workspace], not a member
+# of the root workspace) stay IN the context: examples/*/Dockerfile needs
+# repo root as its build context (to reach its sibling `../../crates/*` path
+# dependency — see that Dockerfile's own comment), and gcloud/docker builds
+# invoked with repo root as context need examples/ present for that. Only
+# their build artifacts are excluded above (examples/*/target/).
 
 # Docs
 README.ja.md

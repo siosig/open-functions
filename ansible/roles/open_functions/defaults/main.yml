@@ -49,11 +49,11 @@ open_functions_source_mounts: []
 # uses ProtectHome=read-only instead (see templates/open-functions.service.j2).
 open_functions_source_dirs: []
 
-# --- pubsub (ps-rs co-location) ---------------------------------------------
+# --- pubsub (open-pubusb co-location) ---------------------------------------------
 
 open_functions_pubsub_base_url: "http://127.0.0.1:8085"
 open_functions_pubsub_project: local
-# open-functions's own URL, as seen from ps-rs. Empty lets open-functions derive it itself.
+# open-functions's own URL, as seen from open-pubusb. Empty lets open-functions derive it itself.
 open_functions_pubsub_push_base_url: ""
 
 # --- Shutdown / logging -------------------------------------------------------

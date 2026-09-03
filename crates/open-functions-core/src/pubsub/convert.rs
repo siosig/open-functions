@@ -1,6 +1,6 @@
 //! Pub/Sub Push envelope parsing and CloudEvent construction.
 //!
-//! Converts the JSON body ps-rs sends to `/_cf/push/{name}` (Pub/Sub standard
+//! Converts the JSON body open-pubusb sends to `/_cf/push/{name}` (Pub/Sub standard
 //! Push format) into a [`cloudevents::Event`] the host POSTs to the function
 //! instance in binary content mode, per
 //! `specs/001-cloud-functions-local/contracts/function-contract.md`'s

@@ -28,8 +28,8 @@ galaxy_info:
     - docker
     - systemd
 
-# No hard role dependency on ps_rs: the two roles co-exist on the same
-# host (see ansible-vars.md, "co-location with ps-rs") but are applied
+# No hard role dependency on open_pubusb: the two roles co-exist on the same
+# host (see ansible-vars.md, "co-location with open-pubusb") but are applied
 # independently, in order, from the top-level playbook - not chained
 # through meta dependencies.
 dependencies: []

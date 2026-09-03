@@ -121,7 +121,7 @@ open-functions fn stop <name>
 
 ## Pub/Sub 連携
 
-`--trigger-topic` を指定した関数は、Pub/Sub 互換の REST サービス（姉妹プロジェクト `ps-rs` がクラウド接続なしでローカルに実装）からの Push 配信で起動する。open-functions は各 Push 配信を `google.cloud.pubsub.topic.v1.messagePublished` CloudEvent に変換してから関数へ転送し、関数の応答に応じて ack するか再送に委ねる——実際の Cloud Run 関数に対する Eventarc の Pub/Sub イベント配信と同じ挙動。
+`--trigger-topic` を指定した関数は、Pub/Sub 互換の REST サービス（姉妹プロジェクト `open-pubusb` がクラウド接続なしでローカルに実装）からの Push 配信で起動する。open-functions は各 Push 配信を `google.cloud.pubsub.topic.v1.messagePublished` CloudEvent に変換してから関数へ転送し、関数の応答に応じて ack するか再送に委ねる——実際の Cloud Run 関数に対する Eventarc の Pub/Sub イベント配信と同じ挙動。
 
 ## 観測性
 

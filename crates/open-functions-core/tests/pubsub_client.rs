@@ -1,6 +1,6 @@
-//! Integration tests for `PsRsClient` against a mocked ps-rs REST surface
+//! Integration tests for `OpenPubusbClient` against a mocked open-pubusb REST surface
 //! (`wiremock`), per plan.md's "core integration" testing strategy row
-//! ("PubSubBinding (`wiremock` mocks ps-rs; 409/404/connection failure)").
+//! ("PubSubBinding (`wiremock` mocks open-pubusb; 409/404/connection failure)").
 //!
 //! Note: this crate promotes `clippy::unwrap_used`/`clippy::expect_used` to
 //! warnings (errors under `-D warnings`), and that applies to test targets
@@ -11,7 +11,7 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 use open_functions_core::pubsub::client::{
-    PsRsClient, PubSubError, PushConfig, SubscriptionRequest,
+    OpenPubusbClient, PubSubError, PushConfig, SubscriptionRequest,
 };
 use serde_json::{Value, json};
 use wiremock::matchers::{body_json, method, path};
@@ -34,8 +34,8 @@ fn err<T: std::fmt::Debug, E>(result: Result<T, E>, context: &str) -> E {
 
 const PROJECT: &str = "test-project";
 
-fn client_for(base_url: String) -> PsRsClient {
-    PsRsClient::new(base_url, PROJECT.to_string(), Duration::from_secs(5))
+fn client_for(base_url: String) -> OpenPubusbClient {
+    OpenPubusbClient::new(base_url, PROJECT.to_string(), Duration::from_secs(5))
 }
 
 fn sample_request() -> SubscriptionRequest {

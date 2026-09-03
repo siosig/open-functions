@@ -19,8 +19,15 @@
 #        - the function's current_revision (GET /v1/functions/<name>)
 #        - the SHA256 of the on-disk build artifact
 #          (<data-dir>/artifacts/<name>/<revision>/function)
-#        - the Prometheus open_functions_builds_total counter, summed across all of
-#          its label combinations (GET /metrics)
+#
+# Deliberately NOT checked: the Prometheus open_functions_builds_total
+# counter. It lives only in the process's in-memory metrics registry (see
+# `crates/open-functions-core/src/registry/service.rs`'s `metrics::counter!`
+# calls) and is never persisted, so a fresh process always reports 0 for it
+# regardless of whether a rebuild happened -- comparing it across a restart
+# would report every single restart as a "rebuild", which is exactly
+# backwards. current_revision and the artifact SHA256 above are the
+# persisted-state invariants that actually prove "no rebuild occurred".
 #
 # Any mismatch fails the script immediately with a diagnostic naming the
 # broken invariant and the iteration it broke on.
@@ -35,8 +42,6 @@ the same --data-dir, asserting that across every restart:
   - the number of registered functions is unchanged
   - the deployed function's current_revision is unchanged (no rebuild)
   - the SHA256 of the function's build artifact on disk is unchanged
-  - the open_functions_builds_total Prometheus counter (summed across all label
-    combinations) is unchanged
 
 ITERATIONS defaults to 20 restarts, for a fast local sanity check. spec.md's
 SC-006 calls for a 100-iteration stress run; run that explicitly with:
@@ -284,19 +289,6 @@ get_artifact_hash() {
   sha256sum "$path" | awk '{print $1}'
 }
 
-get_builds_total() {
-  # open_functions_builds_total is a labeled counter (function, mode, result per
-  # ops-config.md); sum every label combination's value for one comparable
-  # total. Prometheus text exposition format lines are "name{labels} value"
-  # (two whitespace-separated fields), so summing field 2 across every
-  # matching line gives that total. If the metric has not been emitted at
-  # all yet (e.g. before it has a first sample), this correctly yields 0,
-  # and 0 == 0 across restarts is still a valid "no rebuild" invariant.
-  http_call GET "$ADMIN_URL/metrics"
-  expect_status "$HTTP_STATUS" 200 "GET /metrics" "$HTTP_BODY"
-  printf '%s' "$HTTP_BODY" | awk '/^open_functions_builds_total/ {sum += $2} END {print sum + 0}'
-}
-
 log "Starting open-functions serve: data-dir=$DATA_DIR invoke=$INVOKE_URL admin=$ADMIN_URL"
 start_serve
 wait_for_ready "$READY_TIMEOUT_SECS" \
@@ -315,9 +307,8 @@ log "$FN_NAME is ready"
 BASELINE_COUNT=$(get_function_count)
 BASELINE_REVISION=$(get_current_revision)
 BASELINE_HASH=$(get_artifact_hash "$BASELINE_REVISION")
-BASELINE_BUILDS=$(get_builds_total)
 
-log "Baseline captured: functions=$BASELINE_COUNT current_revision=$BASELINE_REVISION artifact_sha256=$BASELINE_HASH open_functions_builds_total=$BASELINE_BUILDS"
+log "Baseline captured: functions=$BASELINE_COUNT current_revision=$BASELINE_REVISION artifact_sha256=$BASELINE_HASH"
 log "Running $ITERATIONS restart iterations..."
 
 for ((i = 1; i <= ITERATIONS; i++)); do
@@ -347,13 +338,8 @@ for ((i = 1; i <= ITERATIONS; i++)); do
     fail "iteration $i: build artifact sha256 changed -- baseline=$BASELINE_HASH now=$hash (the artifact was rebuilt, replaced, or corrupted)"
   fi
 
-  builds=$(get_builds_total)
-  if [[ "$builds" != "$BASELINE_BUILDS" ]]; then
-    fail "iteration $i: open_functions_builds_total changed -- baseline=$BASELINE_BUILDS now=$builds (a rebuild was triggered by the restart)"
-  fi
-
-  log "Iteration $i/$ITERATIONS: OK (functions=$count current_revision=$revision artifact_sha256=$hash open_functions_builds_total=$builds)"
+  log "Iteration $i/$ITERATIONS: OK (functions=$count current_revision=$revision artifact_sha256=$hash)"
 done
 
-log "SUCCESS: $ITERATIONS restart(s) completed. All invariants held: function count, current_revision, build artifact sha256, and open_functions_builds_total never changed."
+log "SUCCESS: $ITERATIONS restart(s) completed. All invariants held: function count, current_revision, and build artifact sha256 never changed."
 exit 0

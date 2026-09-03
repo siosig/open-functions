@@ -171,7 +171,7 @@ admin API these commands talk to.
 ## Pub/Sub integration
 
 A `--trigger-topic` function is invoked via Push delivery from a
-Pub/Sub-compatible REST service (the sibling project `ps-rs` implements
+Pub/Sub-compatible REST service (the sibling project `open-pubusb` implements
 this locally, with no cloud dependency); `open-functions` converts each Push
 delivery into a `google.cloud.pubsub.topic.v1.messagePublished` CloudEvent
 before forwarding it to the function, and acks or lets the delivery retry

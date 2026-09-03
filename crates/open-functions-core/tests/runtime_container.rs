@@ -6,7 +6,7 @@
 //! Opt-in and skipped by default (needs a real, reachable Docker daemon):
 //! set `OPEN_FUNCTIONS_TEST_DOCKER=1` to run, matching this workspace's existing
 //! opt-in-external-dependency convention (see `crates/open-functions/tests/e2e_pubsub.rs`'s
-//! `OPEN_FUNCTIONS_TEST_PSRS_URL` gate). `.github/workflows/ci.yml`'s `docker-tests`
+//! `OPEN_FUNCTIONS_TEST_OPEN_PUBUSB_URL` gate). `.github/workflows/ci.yml`'s `docker-tests`
 //! job sets this and runs the whole workspace under `cargo nextest run`.
 //!
 //! The test image is built from a throwaway Dockerfile written to a tempdir

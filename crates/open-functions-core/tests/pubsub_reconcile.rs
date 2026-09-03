@@ -1,5 +1,5 @@
 //! Integration tests for the Pub/Sub `TriggerBinding` reconciler (T046),
-//! using `wiremock` to stand in for ps-rs.
+//! using `wiremock` to stand in for open-pubusb.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use open_functions_core::model::binding::BindingState;
-use open_functions_core::pubsub::client::PsRsClient;
+use open_functions_core::pubsub::client::OpenPubusbClient;
 use open_functions_core::pubsub::reconcile::{DesiredBinding, Reconciler};
 use open_functions_core::registry::memory::MemoryStore;
 use open_functions_core::registry::store::Store;
@@ -25,7 +25,7 @@ fn desired(function_name: &str) -> DesiredBinding {
 }
 
 fn reconciler(server: &MockServer, store: Arc<dyn Store>) -> Reconciler {
-    let client = PsRsClient::new(server.uri(), "local".to_string(), Duration::from_secs(5));
+    let client = OpenPubusbClient::new(server.uri(), "local".to_string(), Duration::from_secs(5));
     Reconciler::new(
         client,
         store,
@@ -41,10 +41,10 @@ async fn unreachable_then_backoff_then_bound() {
     let recon = reconciler(&server, Arc::clone(&store));
     let d = desired("on-orders");
 
-    // ps-rs not mocked at all yet -> connection refused (wiremock server is
+    // open-pubusb not mocked at all yet -> connection refused (wiremock server is
     // up, but we point the client at a different, unused port to simulate
     // "unreachable" cleanly).
-    let dead_client = PsRsClient::new(
+    let dead_client = OpenPubusbClient::new(
         "http://127.0.0.1:1".to_string(),
         "local".to_string(),
         Duration::from_millis(200),
@@ -59,7 +59,7 @@ async fn unreachable_then_backoff_then_bound() {
     assert_eq!(binding.state, BindingState::Pending);
     assert!(binding.next_retry_at.is_some());
 
-    // Now ps-rs is reachable (via the real mock server) and accepts the PUT.
+    // Now open-pubusb is reachable (via the real mock server) and accepts the PUT.
     Mock::given(method("PUT"))
         .and(path(
             "/v1/projects/local/subscriptions/open-functions-on-orders",
@@ -226,7 +226,7 @@ async fn unbind_success_removes_binding_entirely() {
 
 #[tokio::test]
 async fn unbind_failure_persists_unbinding_state_for_retry() {
-    let dead_client = PsRsClient::new(
+    let dead_client = OpenPubusbClient::new(
         "http://127.0.0.1:1".to_string(),
         "local".to_string(),
         Duration::from_millis(200),

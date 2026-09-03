@@ -10,7 +10,7 @@
 - [Variables](#variables)
 - [Tags](#tags)
 - [Idempotency](#idempotency)
-- [Co-location with ps-rs](#co-location-with-ps-rs)
+- [Co-location with open-pubusb](#co-location-with-open-pubusb)
 
 ## Overview
 
@@ -80,7 +80,7 @@ A handful of variables are worth setting explicitly on a first run:
 | `open_functions_version` | Pin a specific open-functions release instead of tracking latest. |
 | `open_functions_admin_token` | Required (role preflight fails otherwise) if `open_functions_admin_bind_address` is set to anything non-loopback. Use Ansible Vault to store it. |
 
-The rest of the public variables — ports, data directory, ps-rs
+The rest of the public variables — ports, data directory, open-pubusb
 integration, Docker network name, verification behavior, and so on — have
 sane defaults. See `roles/open_functions/defaults/main.yml` for the full
 list and each variable's own comment.
@@ -90,7 +90,7 @@ list and each variable's own comment.
 Copy `inventory/hosts.example.yml` to your own inventory file (e.g.
 `inventory/hosts.yml`) and adjust hostnames, connection details, and
 per-host variables. It includes two worked examples: a standalone systemd
-deployment, and a Docker deployment co-located with ps-rs.
+deployment, and a Docker deployment co-located with open-pubusb.
 
 ## Variables
 
@@ -114,20 +114,20 @@ A second run of `site.yml` with the same variables against a host that is
 already in the desired state reports `changed=0` for every task — no
 service restarts, no file rewrites, no container recreation.
 
-## Co-location with ps-rs
+## Co-location with open-pubusb
 
-The standard setup runs ps-rs (a sibling Pub/Sub-compatible local service,
-ports 8085/8086; see the separate `~/workspace/siosig/ps-rs` project — it is
+The standard setup runs open-pubusb (a sibling Pub/Sub-compatible local service,
+ports 8085/8086; see the separate `~/workspace/siosig/open-pubusb` project — it is
 not part of this repository) and open-functions (ports 8080/8081) on the same host,
-with open-functions configured to call ps-rs for Pub/Sub trigger registration and
+with open-functions configured to call open-pubusb for Pub/Sub trigger registration and
 event delivery.
 
-`site.yml` applies only the `open_functions` role, since the `ps_rs` role lives in
-the ps-rs project rather than in this repository. Deploy ps-rs separately,
+`site.yml` applies only the `open_functions` role, since the `open_pubusb` role lives in
+the open-pubusb project rather than in this repository. Deploy open-pubusb separately,
 using that project's own playbook, against the same host or inventory. If
-you vendor the `ps_rs` role into this repo (e.g. under
-`ansible/roles/ps_rs`) or pull it in via a separate Galaxy requirement,
-`site.yml` documents where to add it — apply `ps_rs` before `open_functions` in the
+you vendor the `open_pubusb` role into this repo (e.g. under
+`ansible/roles/open_pubusb`) or pull it in via a separate Galaxy requirement,
+`site.yml` documents where to add it — apply `open_pubusb` before `open_functions` in the
 `roles:` list.
 
 In Docker mode, the standard co-location example connects both containers
@@ -136,7 +136,7 @@ container name:
 
 ```yaml
 open_functions_docker_network: open-functions
-open_functions_pubsub_base_url: http://ps-rs:8085
+open_functions_pubsub_base_url: http://open-pubusb:8085
 open_functions_pubsub_push_base_url: http://open-functions:8080
 ```
 

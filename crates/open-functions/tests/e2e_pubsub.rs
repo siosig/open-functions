@@ -1,19 +1,28 @@
-//! End-to-end test for User Story 2 (T048): against a *real* ps-rs instance,
+//! End-to-end test for User Story 2 (T048): against a *real* open-pubusb instance,
 //! creates a topic, deploys `examples/hello-pubsub` with `--trigger-topic`,
 //! publishes a message, confirms it reaches the function (via its structured
 //! stdout log line, captured through open-functions's own process — see
 //! `runtime::process::spawn_log_drain`, which re-emits a function instance's
 //! captured stdout as a `tracing` event on `open-functions serve`'s own stdout), then
-//! deletes the function and confirms the ps-rs subscription is torn down.
+//! deletes the function and confirms the open-pubusb subscription is torn down.
 //!
-//! Opt-in and skipped by default: it needs a real, running ps-rs (this
-//! workspace has no way to spin one up itself — ps-rs is a sibling project).
-//! Set `OPEN_FUNCTIONS_TEST_PSRS_URL` (e.g. `http://127.0.0.1:8085`) to run it.
+//! Opt-in and skipped by default: it needs a real, running open-pubusb (this
+//! workspace has no way to spin one up itself — open-pubusb is a sibling project).
+//! Set `OPEN_FUNCTIONS_TEST_OPEN_PUBUSB_URL` (e.g. `http://127.0.0.1:8085`) to run it.
+//! When that open-pubusb runs in a container, also set
+//! `OPEN_FUNCTIONS_TEST_INVOKE_BIND` / `OPEN_FUNCTIONS_TEST_PUSH_BASE_URL` so its
+//! Push deliveries can route back to this process (see `spawn_serve`).
+//!
+//! Requires an open-pubusb build that honors `pushConfig` over REST (its
+//! commit 7c29c98, "feat(rest): accept the full Subscription message on
+//! create"). Against an earlier build, subscription creation succeeds but
+//! silently drops the push config, so no delivery ever arrives and this test
+//! fails on the marker-not-seen assertion.
 //!
 //! Topic/publish calls below follow the standard Pub/Sub REST shape (`PUT
 //! .../topics/{t}` to create, `POST .../topics/{t}:publish` to publish) by
-//! analogy with `PsRsClient`'s own subscriptions REST subset
-//! (`crates/open-functions-core/src/pubsub/client.rs`); adjust here if ps-rs's actual
+//! analogy with `OpenPubusbClient`'s own subscriptions REST subset
+//! (`crates/open-functions-core/src/pubsub/client.rs`); adjust here if open-pubusb's actual
 //! topics API differs.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -75,29 +84,44 @@ async fn spawn_serve(
     data_dir: &std::path::Path,
     invoke_port: u16,
     admin_port: u16,
-    psrs_url: &str,
+    open_pubusb_url: &str,
     project: &str,
 ) -> ServeProcess {
+    // open-pubusb has to be able to *reach back* to this process's invoke
+    // listener to deliver a Push. That works out of the box only when both
+    // run on the same host (the default below). When open-pubusb runs in a
+    // container, loopback inside it is the container itself, so the bind
+    // address and the advertised push URL both have to name an address the
+    // container can route to (e.g. the docker bridge gateway, 172.17.0.1):
+    //
+    //   OPEN_FUNCTIONS_TEST_INVOKE_BIND=0.0.0.0 \
+    //   OPEN_FUNCTIONS_TEST_PUSH_BASE_URL=http://172.17.0.1:28280 \
+    //   OPEN_FUNCTIONS_TEST_OPEN_PUBUSB_URL=http://127.0.0.1:8085 cargo nextest run ...
+    let invoke_bind = std::env::var("OPEN_FUNCTIONS_TEST_INVOKE_BIND")
+        .unwrap_or_else(|_| "127.0.0.1".to_string());
     let bin = assert_cmd::cargo::cargo_bin("open-functions");
-    let mut child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args([
             "serve",
             "--data-dir",
             &data_dir.to_string_lossy(),
             "--invoke-listen",
-            &format!("127.0.0.1:{invoke_port}"),
+            &format!("{invoke_bind}:{invoke_port}"),
             "--admin-listen",
             &format!("127.0.0.1:{admin_port}"),
         ])
         .env("OPEN_FUNCTIONS__PUBSUB__ENABLED", "true")
-        .env("OPEN_FUNCTIONS__PUBSUB__BASE_URL", psrs_url)
+        .env("OPEN_FUNCTIONS__PUBSUB__BASE_URL", open_pubusb_url)
         .env("OPEN_FUNCTIONS__PUBSUB__PROJECT", project)
         .env("OPEN_FUNCTIONS__PUBSUB__RETRY_INITIAL_SECS", "1")
         .env("OPEN_FUNCTIONS__PUBSUB__RETRY_MAX_SECS", "5")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn open-functions serve");
+        .stderr(Stdio::null());
+    if let Ok(push_base_url) = std::env::var("OPEN_FUNCTIONS_TEST_PUSH_BASE_URL") {
+        command.env("OPEN_FUNCTIONS__PUBSUB__PUSH_BASE_URL", push_base_url);
+    }
+    let mut child = command.spawn().expect("spawn open-functions serve");
 
     let stdout = child.stdout.take().expect("child stdout");
     let log_lines = spawn_stdout_collector(stdout);
@@ -124,9 +148,11 @@ async fn spawn_serve(
     }
 }
 
-async fn create_topic(client: &reqwest::Client, psrs_url: &str, project: &str, topic: &str) {
+async fn create_topic(client: &reqwest::Client, open_pubusb_url: &str, project: &str, topic: &str) {
     let resp = client
-        .put(format!("{psrs_url}/v1/projects/{project}/topics/{topic}"))
+        .put(format!(
+            "{open_pubusb_url}/v1/projects/{project}/topics/{topic}"
+        ))
         .json(&json!({}))
         .send()
         .await
@@ -138,11 +164,17 @@ async fn create_topic(client: &reqwest::Client, psrs_url: &str, project: &str, t
     );
 }
 
-async fn publish(client: &reqwest::Client, psrs_url: &str, project: &str, topic: &str, data: &str) {
+async fn publish(
+    client: &reqwest::Client,
+    open_pubusb_url: &str,
+    project: &str,
+    topic: &str,
+    data: &str,
+) {
     let encoded = base64::engine::general_purpose::STANDARD.encode(data);
     let resp = client
         .post(format!(
-            "{psrs_url}/v1/projects/{project}/topics/{topic}:publish"
+            "{open_pubusb_url}/v1/projects/{project}/topics/{topic}:publish"
         ))
         .json(&json!({"messages": [{"data": encoded}]}))
         .send()
@@ -157,22 +189,22 @@ async fn publish(client: &reqwest::Client, psrs_url: &str, project: &str, topic:
 
 #[tokio::test]
 async fn topic_publish_reaches_function_and_delete_removes_subscription() {
-    let Ok(psrs_url) = std::env::var("OPEN_FUNCTIONS_TEST_PSRS_URL") else {
+    let Ok(open_pubusb_url) = std::env::var("OPEN_FUNCTIONS_TEST_OPEN_PUBUSB_URL") else {
         eprintln!(
             "skipping topic_publish_reaches_function_and_delete_removes_subscription: \
-             set OPEN_FUNCTIONS_TEST_PSRS_URL (e.g. http://127.0.0.1:8085) to run against a real ps-rs"
+             set OPEN_FUNCTIONS_TEST_OPEN_PUBUSB_URL (e.g. http://127.0.0.1:8085) to run against a real open-pubusb"
         );
         return;
     };
-    let psrs_url = psrs_url.trim_end_matches('/').to_string();
+    let open_pubusb_url = open_pubusb_url.trim_end_matches('/').to_string();
     let project = "local";
     let topic = format!("open-functions-e2e-{}", uuid::Uuid::new_v4().simple());
 
     let client = reqwest::Client::new();
-    create_topic(&client, &psrs_url, project, &topic).await;
+    create_topic(&client, &open_pubusb_url, project, &topic).await;
 
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let server = spawn_serve(data_dir.path(), 28280, 28281, &psrs_url, project).await;
+    let server = spawn_serve(data_dir.path(), 28280, 28281, &open_pubusb_url, project).await;
 
     let deploy_resp = client
         .put(format!("{}/v1/functions/on-e2e", server.admin_url))
@@ -210,7 +242,7 @@ async fn topic_publish_reaches_function_and_delete_removes_subscription() {
     }
 
     let marker = format!("e2e-marker-{}", uuid::Uuid::new_v4().simple());
-    publish(&client, &psrs_url, project, &topic, &marker).await;
+    publish(&client, &open_pubusb_url, project, &topic, &marker).await;
 
     let seen_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let seen = loop {
@@ -245,7 +277,7 @@ async fn topic_publish_reaches_function_and_delete_removes_subscription() {
     loop {
         let resp = client
             .get(format!(
-                "{psrs_url}/v1/projects/{project}/subscriptions/{sub_name}"
+                "{open_pubusb_url}/v1/projects/{project}/subscriptions/{sub_name}"
             ))
             .send()
             .await
@@ -259,4 +291,15 @@ async fn topic_publish_reaches_function_and_delete_removes_subscription() {
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
+
+    // The topic is this test's own (uuid-suffixed) resource, and open-pubusb
+    // is a long-lived shared instance here — without this, every run leaves
+    // another `open-functions-e2e-<uuid>` topic behind forever. Best-effort:
+    // a failure to clean up must not fail an otherwise-passing test.
+    let _ = client
+        .delete(format!(
+            "{open_pubusb_url}/v1/projects/{project}/topics/{topic}"
+        ))
+        .send()
+        .await;
 }

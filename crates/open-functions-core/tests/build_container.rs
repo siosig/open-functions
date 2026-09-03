@@ -5,7 +5,7 @@
 //! and its first run pulls `rust:1-bookworm` (a large image) and does a full
 //! cold dependency compile inside the container, which can take several
 //! minutes. Set `OPEN_FUNCTIONS_TEST_DOCKER` (to any value) to run it, mirroring the
-//! `OPEN_FUNCTIONS_TEST_PSRS_URL` opt-in idiom used by `crates/open-functions/tests/e2e_pubsub.rs`
+//! `OPEN_FUNCTIONS_TEST_OPEN_PUBUSB_URL` opt-in idiom used by `crates/open-functions/tests/e2e_pubsub.rs`
 //! for other tests that need a real external dependency.
 //!
 //! Note: this crate configures `clippy::unwrap_used`/`clippy::expect_used` as

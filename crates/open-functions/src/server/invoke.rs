@@ -4,11 +4,11 @@
 //! status codes in `contracts/function-contract.md`'s "Status codes" table.
 //!
 //! `/_cf/push/{name}` (Pub/Sub push delivery, `Resolved::Push`) validates and
-//! converts the ps-rs Push body into a CloudEvent (via `open_functions_core::pubsub`),
+//! converts the open-pubusb Push body into a CloudEvent (via `open_functions_core::pubsub`),
 //! forwards it to the function instance in CloudEvents binary content mode,
 //! and maps the instance's response per function-contract.md's "Pub/Sub
 //! Push → CloudEvent conversion" status table (2xx → 204 Ack; failures → the
-//! status ps-rs should treat as Nack).
+//! status open-pubusb should treat as Nack).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -39,7 +39,7 @@ pub struct InvokeState {
     pub forwarder: Arc<Forwarder>,
     /// `pubsub.project`, used to build the CloudEvent `source` field for
     /// Push deliveries. `None` when `pubsub.enabled = false` (Push requests
-    /// arriving anyway — e.g. a stale ps-rs subscription — get a 400).
+    /// arriving anyway — e.g. a stale open-pubusb subscription — get a 400).
     pub pubsub_project: Option<String>,
 }
 
@@ -253,10 +253,10 @@ fn record_invocation(
     );
 }
 
-/// Handles `POST /_cf/push/{function}` (ps-rs Pub/Sub Push delivery):
+/// Handles `POST /_cf/push/{function}` (open-pubusb Pub/Sub Push delivery):
 /// validates and converts the body to a CloudEvent, forwards it to the
 /// function instance in binary content mode, and maps the outcome to the
-/// status ps-rs should treat as Ack/Nack, per function-contract.md.
+/// status open-pubusb should treat as Ack/Nack, per function-contract.md.
 async fn handle_push(
     state: InvokeState,
     function: String,
@@ -388,7 +388,7 @@ async fn handle_push(
         }
         Ok(resp) => {
             // Transparent per function-contract.md: pass through the
-            // instance's own status (Nack -> ps-rs retries).
+            // instance's own status (Nack -> open-pubusb retries).
             record_push_received(&function, "nack");
             let status = resp.status();
             record_invocation(&function, "event", "ok", status.as_u16(), duration);

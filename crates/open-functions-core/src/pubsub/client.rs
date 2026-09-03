@@ -1,7 +1,7 @@
-//! Thin REST client for ps-rs's Pub/Sub-compatible subscription-management API.
+//! Thin REST client for open-pubusb's Pub/Sub-compatible subscription-management API.
 //!
-//! Endpoints and shapes come from the ps-rs contract doc
-//! (`ps-rs/specs/001-local-pubsub-service/contracts/pubsub-api.md`, "REST (HTTP/JSON) subset"):
+//! Endpoints and shapes come from the open-pubusb contract doc
+//! (`open-pubusb/specs/001-local-pubsub-service/contracts/pubsub-api.md`, "REST (HTTP/JSON) subset"):
 //!
 //! | HTTP   | Path                                             | gRPC equivalent    |
 //! |--------|---------------------------------------------------|--------------------|
@@ -9,11 +9,20 @@
 //! | GET    | `/v1/projects/{p}/subscriptions/{s}`               | GetSubscription    |
 //! | DELETE | `/v1/projects/{p}/subscriptions/{s}`               | DeleteSubscription |
 //!
-//! Notably, the REST subset does **not** expose a PATCH method or a
+//! Notably, this client does not use a PATCH method or a
 //! `:modifyPushConfig` path for subscriptions -- any path other than the
-//! documented ones returns `501`. So there is no partial-update mechanism
-//! for `pushConfig`; the only way to change it is to delete the
-//! subscription and re-create it (see [`PsRsClient::recreate_subscription`]).
+//! documented ones returns `501`. So it changes `pushConfig` by deleting
+//! the subscription and re-creating it (see
+//! [`OpenPubusbClient::recreate_subscription`]). open-pubusb has since
+//! grown a `:modifyPushConfig` verb (its commit 7c29c98), so this could be
+//! simplified to a single call once that version is the supported floor;
+//! delete-then-create keeps working against both.
+//!
+//! That same open-pubusb commit is what makes `pushConfig` on
+//! PUT-to-create take effect at all: before it, the REST create handler
+//! decoded a hand-written struct that silently dropped `pushConfig`, so
+//! every subscription this client created came back pull-only and no Push
+//! delivery ever arrived (see quickstart.md's Pub/Sub execution records).
 //!
 //! This client is intentionally a thin, honest HTTP wrapper: no retries, no
 //! backoff, no swallowing of error statuses. Reconciliation policy (what to
@@ -24,22 +33,39 @@ use std::time::Duration;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 
-/// Errors returned by [`PsRsClient`].
+/// Extracts the bare subscription id from either form a caller may hold: a
+/// short id (`open-functions-on-orders`, what [`crate::pubsub::reconcile`]
+/// derives when it first creates a subscription) or a full resource name
+/// (`projects/local/subscriptions/open-functions-on-orders`, what open-pubusb
+/// *returns* and what `TriggerBinding.subscription` therefore stores, per
+/// admin-api.md's documented `binding.subscription` shape).
+///
+/// Without this, [`OpenPubusbClient::subscription_url`] would prepend the
+/// collection path to an already-qualified name and produce
+/// `.../subscriptions/projects/local/subscriptions/<id>`, which open-pubusb
+/// answers with `501` -- silently stranding the real subscription on every
+/// unbind (the delete "fails", the reconciler retries the same broken URL
+/// forever, and the subscription outlives the function that owned it).
+fn subscription_id(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+/// Errors returned by [`OpenPubusbClient`].
 #[derive(Debug, thiserror::Error)]
 pub enum PubSubError {
-    /// The HTTP request never completed a round-trip with ps-rs: DNS
+    /// The HTTP request never completed a round-trip with open-pubusb: DNS
     /// failure, connection refused, or a timeout. Callers should treat this
     /// as transient and retry with backoff.
-    #[error("ps-rs unreachable at {url}: {source}")]
+    #[error("open-pubusb unreachable at {url}: {source}")]
     Unreachable {
         url: String,
         #[source]
         source: reqwest::Error,
     },
-    /// ps-rs answered with a non-2xx status (or a 2xx body that could not
+    /// open-pubusb answered with a non-2xx status (or a 2xx body that could not
     /// be parsed as the expected JSON shape). Callers should treat this as
     /// a permanent error for the given request, not retry blindly.
-    #[error("ps-rs returned {status}: {body}")]
+    #[error("open-pubusb returned {status}: {body}")]
     Http { status: u16, body: String },
 }
 
@@ -51,7 +77,7 @@ pub struct PushConfig {
 }
 
 /// Body of `PUT /v1/projects/{p}/subscriptions/{s}` (CreateSubscription).
-/// `name` is not included: it is implied by the URL, matching ps-rs's
+/// `name` is not included: it is implied by the URL, matching open-pubusb's
 /// proto3 JSON mapping for the PUT-to-create convention.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionRequest {
@@ -64,7 +90,7 @@ pub struct SubscriptionRequest {
 }
 
 /// `google.pubsub.v1.Subscription` (partial): only the fields open-functions reads.
-/// Unknown fields in ps-rs's response are ignored by serde's default
+/// Unknown fields in open-pubusb's response are ignored by serde's default
 /// behavior, so this stays forward-compatible with the full proto shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {
@@ -78,14 +104,14 @@ pub struct Subscription {
     pub ack_deadline_seconds: u32,
 }
 
-/// REST client for ps-rs's subscription-management surface.
-pub struct PsRsClient {
+/// REST client for open-pubusb's subscription-management surface.
+pub struct OpenPubusbClient {
     base_url: String,
     project: String,
     http: reqwest::Client,
 }
 
-impl PsRsClient {
+impl OpenPubusbClient {
     pub fn new(base_url: String, project: String, request_timeout: Duration) -> Self {
         let http = reqwest::Client::builder()
             .timeout(request_timeout)
@@ -107,7 +133,9 @@ impl PsRsClient {
     fn subscription_url(&self, name: &str) -> String {
         format!(
             "{}/v1/projects/{}/subscriptions/{}",
-            self.base_url, self.project, name
+            self.base_url,
+            self.project,
+            subscription_id(name)
         )
     }
 
@@ -213,7 +241,7 @@ impl PsRsClient {
 
     /// Changes an existing subscription's `pushConfig`.
     ///
-    /// ps-rs's REST subset exposes no PATCH method and no
+    /// open-pubusb's REST subset exposes no PATCH method and no
     /// `:modifyPushConfig` path for subscriptions (see the module doc
     /// comment) -- only PUT/GET/DELETE plus the `:pull`/`:acknowledge`/
     /// `:modifyAckDeadline` action verbs, and any other path is `501`. So
@@ -235,5 +263,48 @@ impl PsRsClient {
     ) -> Result<Subscription, PubSubError> {
         self.delete_subscription(name).await?;
         self.create_subscription(name, req).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client() -> OpenPubusbClient {
+        OpenPubusbClient::new(
+            "http://127.0.0.1:8085".to_string(),
+            "local".to_string(),
+            Duration::from_secs(5),
+        )
+    }
+
+    #[test]
+    fn subscription_url_accepts_a_bare_id() {
+        assert_eq!(
+            client().subscription_url("open-functions-on-orders"),
+            "http://127.0.0.1:8085/v1/projects/local/subscriptions/open-functions-on-orders"
+        );
+    }
+
+    /// `TriggerBinding.subscription` stores the *full* resource name
+    /// open-pubusb returns from create, and `try_unbind` passes that value
+    /// straight back in. Before `subscription_id` normalized it, this built
+    /// `.../subscriptions/projects/local/subscriptions/...` -- a `501` from
+    /// open-pubusb that left every unbound subscription stranded.
+    #[test]
+    fn subscription_url_accepts_a_full_resource_name() {
+        assert_eq!(
+            client().subscription_url("projects/local/subscriptions/open-functions-on-orders"),
+            "http://127.0.0.1:8085/v1/projects/local/subscriptions/open-functions-on-orders"
+        );
+    }
+
+    #[test]
+    fn subscription_id_is_idempotent_and_never_empty_for_a_bare_id() {
+        assert_eq!(subscription_id("a"), "a");
+        assert_eq!(
+            subscription_id(subscription_id("projects/p/subscriptions/a")),
+            "a"
+        );
     }
 }

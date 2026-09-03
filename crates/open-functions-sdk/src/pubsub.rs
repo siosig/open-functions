@@ -34,7 +34,7 @@ pub struct PubsubMessage {
 }
 
 /// The `data` payload of a `google.cloud.pubsub.topic.v1.messagePublished`
-/// [`CloudEvent`](crate::CloudEvent), as produced by ps-rs's Push→CloudEvent
+/// [`CloudEvent`](crate::CloudEvent), as produced by open-pubusb's Push→CloudEvent
 /// conversion (and by real GCP Eventarc Pub/Sub triggers). Decode it from an
 /// event with [`CloudEventExt::data_as`](crate::CloudEventExt::data_as).
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -467,7 +467,7 @@ fn is_loopback_host(listen: &str) -> bool {
 
 /// Validates configuration-file-shape rules from the "Validation and startup failure" table in
 /// `ops-config.md` that are checkable without I/O. Rules requiring runtime probing
-/// (`storage.data_dir` writability, `build.mode` tool availability, ps-rs reachability,
+/// (`storage.data_dir` writability, `build.mode` tool availability, open-pubusb reachability,
 /// cgroup writability) are intentionally out of scope for this pure function.
 pub fn validate(cfg: &AppConfig) -> Result<(), ConfigError> {
     if !is_loopback_host(&cfg.admin.listen)

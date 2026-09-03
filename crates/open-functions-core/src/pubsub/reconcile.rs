@@ -1,4 +1,4 @@
-//! `TriggerBinding` reconciliation (T052): creates/fixes/removes ps-rs Push
+//! `TriggerBinding` reconciliation (T052): creates/fixes/removes open-pubusb Push
 //! subscriptions for Pub/Sub-triggered functions, per plan.md's
 //! "PubSubBinding" Design Notes and data-model.md's `TriggerBinding` state
 //! machine (`pending → bound`, `→ error`, `→ unbinding → [removed]`).
@@ -9,7 +9,7 @@ use std::time::Duration;
 use chrono::Utc;
 
 use crate::model::binding::{BindingState, TriggerBinding};
-use crate::pubsub::client::{PsRsClient, PubSubError, PushConfig, SubscriptionRequest};
+use crate::pubsub::client::{OpenPubusbClient, PubSubError, PushConfig, SubscriptionRequest};
 use crate::registry::store::{Store, StoreError};
 
 /// The desired end-state of a Pub/Sub trigger binding, as computed by the
@@ -23,13 +23,13 @@ pub struct DesiredBinding {
     pub ack_deadline_seconds: u32,
 }
 
-/// Reconciles `TriggerBinding`s against ps-rs. Stateless beyond its
+/// Reconciles `TriggerBinding`s against open-pubusb. Stateless beyond its
 /// dependencies (`client`, `store`) and backoff bounds; every method persists
 /// its outcome to `store` before returning, so a crash mid-reconciliation
 /// just means the next sweep (or the next explicit call) picks up where the
 /// stored `TriggerBinding` state left off.
 pub struct Reconciler {
-    client: PsRsClient,
+    client: OpenPubusbClient,
     store: Arc<dyn Store>,
     initial_backoff: Duration,
     max_backoff: Duration,
@@ -41,7 +41,7 @@ fn subscription_name(function_name: &str) -> String {
 
 impl Reconciler {
     pub fn new(
-        client: PsRsClient,
+        client: OpenPubusbClient,
         store: Arc<dyn Store>,
         initial_backoff: Duration,
         max_backoff: Duration,
@@ -135,7 +135,7 @@ impl Reconciler {
                     topic: desired.topic.clone(),
                     push_endpoint: desired.push_endpoint.clone(),
                     state: BindingState::Pending,
-                    last_error: Some("ps-rs unreachable".to_string()),
+                    last_error: Some("open-pubusb unreachable".to_string()),
                     next_retry_at: Some(Utc::now() + backoff),
                 }
             }
@@ -152,7 +152,7 @@ impl Reconciler {
                     topic: desired.topic.clone(),
                     push_endpoint: desired.push_endpoint.clone(),
                     state: BindingState::Pending,
-                    last_error: Some(format!("ps-rs {status}: {body}")),
+                    last_error: Some(format!("open-pubusb {status}: {body}")),
                     next_retry_at: Some(Utc::now() + backoff),
                 }
             }
@@ -166,7 +166,7 @@ impl Reconciler {
                     topic: desired.topic.clone(),
                     push_endpoint: desired.push_endpoint.clone(),
                     state: BindingState::Error,
-                    last_error: Some(format!("ps-rs {status}: {body}")),
+                    last_error: Some(format!("open-pubusb {status}: {body}")),
                     next_retry_at: None,
                 }
             }
@@ -256,7 +256,7 @@ impl Reconciler {
     /// `TriggerBinding`, so this uses a conservative default; the registry's
     /// next successful `register` call will re-derive the exact desired
     /// value from the `Function` record and call `try_bind` directly, this
-    /// sweep is only a safety net for bindings ps-rs was unreachable for).
+    /// sweep is only a safety net for bindings open-pubusb was unreachable for).
     /// `Unbinding` bindings are retried via [`Self::try_unbind`].
     pub async fn sweep_once(&self, default_ack_deadline_secs: u32, project: &str) {
         let bindings = match self.store.list_bindings() {

@@ -7,7 +7,7 @@
 #
 # See README.md for prerequisites and the full variable reference
 # (roles/open_functions/defaults/main.yml), and inventory/hosts.example.yml for
-# a starting inventory, including the standard open-functions + ps-rs co-location
+# a starting inventory, including the standard open-functions + open-pubusb co-location
 # example in Docker mode.
 #
 # Tag reference (see the open_functions role): preflight, install, config, service,
@@ -19,20 +19,20 @@
   become: true
   gather_facts: true
 
-  # The standard co-located setup runs ps-rs (Pub/Sub-compatible REST API,
+  # The standard co-located setup runs open-pubusb (Pub/Sub-compatible REST API,
   # ports 8085/8086) alongside open-functions (8080/8081) on the same host, with
-  # open_functions_pubsub_base_url pointing at it. ps-rs's own Ansible role (ps_rs)
-  # lives in the separate ps-rs project (~/workspace/siosig/ps-rs), not in
+  # open_functions_pubsub_base_url pointing at it. open-pubusb's own Ansible role (open_pubusb)
+  # lives in the separate open-pubusb project (~/workspace/siosig/open-pubusb), not in
   # this repository, so it is not declared here. If that project's role is
-  # vendored into this repo (e.g. under ansible/roles/ps_rs) or pulled in
+  # vendored into this repo (e.g. under ansible/roles/open_pubusb) or pulled in
   # via a separate `requirements.yml` role/collection entry, apply it before
   # open_functions by uncommenting a block like:
   #
   # roles:
-  #   - role: ps_rs
+  #   - role: open_pubusb
   #   - role: open_functions
   #
-  # Without that, apply only open_functions here and run the ps-rs project's own
+  # Without that, apply only open_functions here and run the open-pubusb project's own
   # playbook separately against the same host/inventory.
   roles:
     - role: open_functions
